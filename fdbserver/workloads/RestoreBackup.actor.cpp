@@ -30,8 +30,6 @@ struct RestoreBackupWorkload final : TestWorkload {
 
 	FileBackupAgent backupAgent;
 	Reference<IBackupContainer> backupContainer;
-	Future<Void> agentFuture;
-	double backupPollDelay = 1.0 / CLIENT_KNOBS->BACKUP_AGGREGATE_POLL_RATE;
 
 	Standalone<StringRef> backupDir;
 	Standalone<StringRef> tag;
@@ -60,8 +58,8 @@ struct RestoreBackupWorkload final : TestWorkload {
 				wait(tr.onError(e));
 			}
 		}
-		EBackupState backupState = wait(self->backupAgent.waitBackup(cx, self->tag.toString(), self->stopWhenDone,
-		                                                             &self->backupContainer, &backupUID));
+		EBackupState backupState = wait(self->backupAgent.waitBackup(
+		    cx, self->tag.toString(), self->stopWhenDone, &self->backupContainer, &backupUID));
 		if (backupState == EBackupState::STATE_COMPLETED) {
 			return Void();
 		} else if (backupState == EBackupState::STATE_RUNNING_DIFFERENTIAL) {
@@ -109,12 +107,11 @@ struct RestoreBackupWorkload final : TestWorkload {
 	}
 
 	ACTOR static Future<Void> _start(RestoreBackupWorkload* self, Database cx) {
-		self->agentFuture = self->backupAgent.run(cx, &self->backupPollDelay, CLIENT_KNOBS->SIM_BACKUP_TASKS_PER_AGENT);
 		wait(delay(self->delayFor));
 		wait(waitOnBackup(self, cx));
 		wait(clearDatabase(cx));
-		wait(success(self->backupAgent.restore(cx, cx, self->tag, Key(self->backupContainer->getURL()), true,
-		                                       ::invalidVersion, true)));
+		wait(success(self->backupAgent.restore(
+		    cx, cx, self->tag, Key(self->backupContainer->getURL()), true, ::invalidVersion, true)));
 		return Void();
 	}
 

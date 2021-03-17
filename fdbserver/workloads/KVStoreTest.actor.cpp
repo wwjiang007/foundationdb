@@ -23,14 +23,14 @@
 #include "fdbserver/workloads/workloads.actor.h"
 #include "fdbserver/IKeyValueStore.h"
 #include "flow/ActorCollection.h"
-#include "flow/actorcompiler.h"  // This must be the last #include.
+#include "flow/actorcompiler.h" // This must be the last #include.
 
-extern IKeyValueStore *makeDummyKeyValueStore();
+extern IKeyValueStore* makeDummyKeyValueStore();
 
 template <class T>
-class Histogram {
+class TestHistogram {
 public:
-	Histogram(int minSamples = 100) : minSamples(minSamples) { reset(); }
+	TestHistogram(int minSamples = 100) : minSamples(minSamples) { reset(); }
 
 	void reset() {
 		N = 0;
@@ -43,8 +43,10 @@ public:
 		if (!N) {
 			minSample = maxSample = x;
 		} else {
-			if (x < minSample) minSample = x;
-			if (maxSample < x) maxSample = x;
+			if (x < minSample)
+				minSample = x;
+			if (maxSample < x)
+				maxSample = x;
 		}
 		sum += x;
 		sumSQ += x * x;
@@ -58,24 +60,28 @@ public:
 			}
 		}
 	}
-//	void addHistogram(const Histrogram& h2);
+	//	void addHistogram(const Histrogram& h2);
 
 	T mean() const { return sum * (1.0 / N); } // exact
 	const T& min() const { return minSample; }
 	const T& max() const { return maxSample; }
 	T stdDev() const {
-		if (!N) return T();
+		if (!N)
+			return T();
 		return sqrt((sumSQ * N - sum * sum) * (1.0 / (N * (N - 1))));
 	}
 	T percentileEstimate(double p) {
 		ASSERT(p <= 1 && p >= 0);
 		int size = samples.size();
-		if (!size) return T();
-		if (size == 1) return samples[0];
+		if (!size)
+			return T();
+		if (size == 1)
+			return samples[0];
 		std::sort(samples.begin(), samples.end());
 		double fi = p * double(size - 1);
 		int li = p * double(size - 1);
-		if (li == size - 1) return samples.back();
+		if (li == size - 1)
+			return samples.back();
 		double alpha = fi - li;
 		return samples[li] * (1 - alpha) + samples[li + 1] * alpha;
 	}
@@ -120,7 +126,8 @@ struct KVTest {
 
 	Version get(KeyRef key, Version version) {
 		auto s = allSets.find(key);
-		if (s == allSets.end()) return startVersion;
+		if (s == allSets.end())
+			return startVersion;
 		auto& sets = s->value;
 		auto it = sets.lastLessOrEqual(version);
 		return it != sets.end() ? *it : startVersion;
@@ -145,7 +152,7 @@ struct KVTest {
 	}
 };
 
-ACTOR Future<Void> testKVRead( KVTest* test, Key key, Histogram<float>* latency, PerfIntCounter* count ) {
+ACTOR Future<Void> testKVRead(KVTest* test, Key key, TestHistogram<float>* latency, PerfIntCounter* count) {
 	// state Version s1 = test->lastCommit;
 	state Version s2 = test->lastDurable;
 
@@ -154,7 +161,8 @@ ACTOR Future<Void> testKVRead( KVTest* test, Key key, Histogram<float>* latency,
 	latency->addSample(timer() - begin);
 	++*count;
 	Version v = val.present() ? BinaryReader::fromStringRef<Version>(val.get(), Unversioned()) : test->startVersion;
-	if (v < test->startVersion) v = test->startVersion; // ignore older data from the database
+	if (v < test->startVersion)
+		v = test->startVersion; // ignore older data from the database
 
 	// ASSERT( s1 <= v || test->get(key, s1)==v );  // Plan A
 	ASSERT(s2 <= v || test->get(key, s2) == v); // Causal consistency
@@ -163,7 +171,7 @@ ACTOR Future<Void> testKVRead( KVTest* test, Key key, Histogram<float>* latency,
 	return Void();
 }
 
-ACTOR Future<Void> testKVReadSaturation( KVTest* test, Histogram<float>* latency, PerfIntCounter* count ) {
+ACTOR Future<Void> testKVReadSaturation(KVTest* test, TestHistogram<float>* latency, PerfIntCounter* count) {
 	while (true) {
 		state double begin = timer();
 		Optional<Value> val = wait(test->store->readValue(test->randomKey()));
@@ -173,7 +181,7 @@ ACTOR Future<Void> testKVReadSaturation( KVTest* test, Histogram<float>* latency
 	}
 }
 
-ACTOR Future<Void> testKVCommit( KVTest* test, Histogram<float>* latency, PerfIntCounter* count ) {
+ACTOR Future<Void> testKVCommit(KVTest* test, TestHistogram<float>* latency, PerfIntCounter* count) {
 	state Version v = test->lastSet;
 	test->lastCommit = v;
 	state double begin = timer();
@@ -184,7 +192,7 @@ ACTOR Future<Void> testKVCommit( KVTest* test, Histogram<float>* latency, PerfIn
 	return Void();
 }
 
-Future<Void> testKVStore( struct KVStoreTestWorkload *const& );
+Future<Void> testKVStore(struct KVStoreTestWorkload* const&);
 
 struct KVStoreTestWorkload : TestWorkload {
 	bool enabled, saturation;
@@ -194,7 +202,7 @@ struct KVStoreTestWorkload : TestWorkload {
 	bool doSetup, doClear, doCount;
 	std::string filename;
 	PerfIntCounter reads, sets, commits;
-	Histogram<float> readLatency, commitLatency;
+	TestHistogram<float> readLatency, commitLatency;
 	double setupTook;
 	std::string storeType;
 
@@ -218,11 +226,12 @@ struct KVStoreTestWorkload : TestWorkload {
 	std::string description() const override { return "KVStoreTest"; }
 	Future<Void> setup(Database const& cx) override { return Void(); }
 	Future<Void> start(Database const& cx) override {
-		if (enabled) return testKVStore(this);
+		if (enabled)
+			return testKVStore(this);
 		return Void();
 	}
 	Future<bool> check(Database const& cx) override { return true; }
-	void metricsFromHistogram(vector<PerfMetric>& m, std::string name, Histogram<float>& h) const {
+	void metricsFromHistogram(vector<PerfMetric>& m, std::string name, TestHistogram<float>& h) const {
 		m.push_back(PerfMetric("Min " + name, 1000.0 * h.min(), true));
 		m.push_back(PerfMetric("Average " + name, 1000.0 * h.mean(), true));
 		m.push_back(PerfMetric("Median " + name, 1000.0 * h.medianEstimate(), true));
@@ -230,7 +239,8 @@ struct KVStoreTestWorkload : TestWorkload {
 		m.push_back(PerfMetric("Max " + name, 1000.0 * h.max(), true));
 	}
 	void getMetrics(vector<PerfMetric>& m) override {
-		if (setupTook) m.push_back(PerfMetric("SetupTook", setupTook, false));
+		if (setupTook)
+			m.push_back(PerfMetric("SetupTook", setupTook, false));
 
 		m.push_back(reads.getMetric());
 		m.push_back(sets.getMetric());
@@ -242,7 +252,7 @@ struct KVStoreTestWorkload : TestWorkload {
 
 WorkloadFactory<KVStoreTestWorkload> KVStoreTestWorkloadFactory("KVStoreTest");
 
-ACTOR Future<Void> testKVStoreMain( KVStoreTestWorkload* workload, KVTest* ptest ) {
+ACTOR Future<Void> testKVStoreMain(KVStoreTestWorkload* workload, KVTest* ptest) {
 	state KVTest& test = *ptest;
 	state ActorCollectionNoErrors ac;
 	state std::deque<Future<Void>> reads;
@@ -263,7 +273,8 @@ ACTOR Future<Void> testKVStoreMain( KVStoreTestWorkload* workload, KVTest* ptest
 			Standalone<RangeResultRef> kv =
 			    wait(test.store->readRange(KeyRangeRef(k, LiteralStringRef("\xff\xff\xff\xff")), 1000));
 			count += kv.size();
-			if (kv.size() < 1000) break;
+			if (kv.size() < 1000)
+				break;
 			k = keyAfter(kv[kv.size() - 1].key);
 		}
 		double elapsed = timer() - cst;
@@ -309,6 +320,7 @@ ACTOR Future<Void> testKVStoreMain( KVStoreTestWorkload* workload, KVTest* ptest
 			}
 		} else {
 			vector<Future<Void>> actors;
+			actors.reserve(100);
 			for (int a = 0; a < 100; a++)
 				actors.push_back(testKVReadSaturation(&test, &workload->readLatency, &workload->reads));
 			wait(timeout(waitForAll(actors), workload->testDuration, Void()));
@@ -337,7 +349,8 @@ ACTOR Future<Void> testKVStoreMain( KVStoreTestWorkload* workload, KVTest* ptest
 					// Read
 					ac.add(testKVRead(&test, test.randomKey(), &workload->readLatency, &workload->reads));
 				}
-				if (t >= end) break;
+				if (t >= end)
+					break;
 			}
 			wait(delayUntil(t));
 		}
@@ -398,6 +411,7 @@ ACTOR Future<Void> testKVStore(KVStoreTestWorkload* workload) {
 	Future<Void> c = test.store->onClosed();
 	test.close();
 	wait(c);
-	if (err.code() != invalid_error_code) throw err;
+	if (err.code() != invalid_error_code)
+		throw err;
 	return Void();
 }

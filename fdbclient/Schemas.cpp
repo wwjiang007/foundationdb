@@ -118,6 +118,11 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
                      "counter":0,
                      "roughness":0.0
                   },
+                  "low_priority_queries":{
+                     "hz":0.0,
+                     "counter":0,
+                     "roughness":0.0
+                  },
                   "bytes_queried":{
                      "hz":0.0,
                      "counter":0,
@@ -535,6 +540,11 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
                "counter":0,
                "roughness":0.0
             },
+            "low_priority_reads":{
+               "hz":0.0,
+               "counter":0,
+               "roughness":0.0
+            },
             "location_requests":{
                "hz":0.0,
                "counter":0,
@@ -587,6 +597,11 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
                "roughness":0.0
             },
             "conflicted":{
+               "hz":0.0,
+               "counter":0,
+               "roughness":0.0
+            },
+            "rejected_for_queued_too_long":{
                "hz":0.0,
                "counter":0,
                "roughness":0.0
@@ -786,7 +801,8 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
          "coordinators":[
             {
                "reachable":true,
-               "address":"127.0.0.1:4701"
+               "address":"127.0.0.1:4701",
+               "protocol": "0fdb00b070010001"
             }
          ],
          "quorum_reachable":true
@@ -939,6 +955,8 @@ const KeyRef JSONSchemas::storageHealthSchema = LiteralStringRef(R"""(
 const KeyRef JSONSchemas::aggregateHealthSchema = LiteralStringRef(R"""(
 {
   "batch_limited": false,
+  "limiting_storage_durability_lag": 5050809,
+  "limiting_storage_queue": 2030,
   "tps_limit": 457082.8105811302,
   "worst_storage_durability_lag": 5050809,
   "worst_storage_queue": 2030,

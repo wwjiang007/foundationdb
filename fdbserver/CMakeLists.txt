@@ -11,7 +11,6 @@ set(FDBSERVER_SRCS
   CoordinatedState.h
   Coordination.actor.cpp
   CoordinationInterface.h
-  CoroFlow.actor.cpp
   CoroFlow.h
   DataDistribution.actor.cpp
   DataDistribution.actor.h
@@ -25,6 +24,7 @@ set(FDBSERVER_SRCS
   FDBExecHelper.actor.h
   GrvProxyServer.actor.cpp
   IDiskQueue.h
+  IKeyValueContainer.h
   IKeyValueStore.h
   IPager.h
   IVersionedStore.h
@@ -46,6 +46,8 @@ set(FDBSERVER_SRCS
   LogSystemDiskQueueAdapter.h
   LogSystemPeekCursor.actor.cpp
   MasterInterface.h
+  MetricLogger.actor.cpp
+  MetricLogger.actor.h
   CommitProxyServer.actor.cpp
   masterserver.actor.cpp
   MutationTracking.h
@@ -63,6 +65,7 @@ set(FDBSERVER_SRCS
   pubsub.h
   QuietDatabase.actor.cpp
   QuietDatabase.h
+  RadixTree.h
   Ratekeeper.actor.cpp
   RatekeeperInterface.h
   RecoveryState.h
@@ -101,6 +104,7 @@ set(FDBSERVER_SRCS
   TLogInterface.h
   TLogServer.actor.cpp
   VersionedBTree.actor.cpp
+  VFSAsync.h
   VFSAsync.cpp
   WaitFailure.actor.cpp
   WaitFailure.h
@@ -115,7 +119,6 @@ set(FDBSERVER_SRCS
   workloads/AsyncFileRead.actor.cpp
   workloads/AsyncFileWrite.actor.cpp
   workloads/AtomicOps.actor.cpp
-  workloads/ReadHotDetection.actor.cpp
   workloads/AtomicOpsApiCorrectness.actor.cpp
   workloads/AtomicRestore.actor.cpp
   workloads/AtomicSwitchover.actor.cpp
@@ -127,6 +130,7 @@ set(FDBSERVER_SRCS
   workloads/BackupToDBAbort.actor.cpp
   workloads/BackupToDBCorrectness.actor.cpp
   workloads/BackupToDBUpgrade.actor.cpp
+  workloads/BlobStoreWorkload.h
   workloads/BulkLoad.actor.cpp
   workloads/BulkSetup.actor.h
   workloads/Cache.actor.cpp
@@ -174,12 +178,14 @@ set(FDBSERVER_SRCS
   workloads/Performance.actor.cpp
   workloads/Ping.actor.cpp
   workloads/PopulateTPCC.actor.cpp
+  workloads/ProtocolVersion.actor.cpp
   workloads/PubSubMultiples.actor.cpp
   workloads/QueuePush.actor.cpp
   workloads/RandomClogging.actor.cpp
   workloads/RandomMoveKeys.actor.cpp
   workloads/RandomSelector.actor.cpp
   workloads/ReadAfterWrite.actor.cpp
+  workloads/ReadHotDetection.actor.cpp
   workloads/ReadWrite.actor.cpp
   workloads/RemoveServersSafely.actor.cpp
   workloads/ReportConflictingKeys.actor.cpp
@@ -214,15 +220,24 @@ set(FDBSERVER_SRCS
   workloads/UnitPerf.actor.cpp
   workloads/UnitTests.actor.cpp
   workloads/Unreadable.actor.cpp
+  workloads/UDPWorkload.actor.cpp
   workloads/VersionStamp.actor.cpp
   workloads/WatchAndWait.actor.cpp
   workloads/Watches.actor.cpp
+  workloads/WatchesSameKeyCorrectness.actor.cpp
   workloads/WorkerErrors.actor.cpp
   workloads/workloads.actor.h
   workloads/WriteBandwidth.actor.cpp
   workloads/WriteDuringRead.actor.cpp
   workloads/WriteTagThrottling.actor.cpp
 )
+
+# ugly hack to make Windows work for now
+if(WIN32)
+  list(APPEND FDBSERVER_SRCS CoroFlowCoro.actor.cpp)
+else()
+  list(APPEND FDBSERVER_SRCS CoroFlow.actor.cpp)
+endif()
 
 add_library(fdb_sqlite STATIC
   sqlite/btree.h
@@ -239,6 +254,10 @@ if (WITH_ROCKSDB_EXPERIMENTAL)
   set(PORTABLE_ROCKSDB 1)
 
   include(CompileRocksDB)
+  # CompileRocksDB sets `lz4_LIBRARIES` to be the shared lib, we want to link
+  # statically, so find the static library here.
+  find_library(lz4_STATIC_LIBRARIES
+    NAMES liblz4.a REQUIRED)
 endif()
 
 # Suppress warnings in sqlite since it's third party
@@ -259,20 +278,22 @@ target_include_directories(fdbserver PRIVATE
 if (WITH_ROCKSDB_EXPERIMENTAL)
   add_dependencies(fdbserver rocksdb)
   target_include_directories(fdbserver PRIVATE ${ROCKSDB_INCLUDE_DIR})
-  target_link_libraries(fdbserver PRIVATE fdbclient fdb_sqlite ${ROCKSDB_LIBRARIES})
+  target_link_libraries(fdbserver PRIVATE fdbclient fdb_sqlite ${ROCKSDB_LIBRARIES} ${lz4_STATIC_LIBRARIES})
 else()
   target_link_libraries(fdbserver PRIVATE fdbclient fdb_sqlite)
 endif()
 
-target_link_libraries(fdbserver PRIVATE toml11_target)
+target_link_libraries(fdbserver PRIVATE toml11_target jemalloc)
 
 if (GPERFTOOLS_FOUND)
   target_link_libraries(fdbserver PRIVATE gperftools)
 endif()
 
-if(GENERATE_DEBUG_PACKAGES)
-  fdb_install(TARGETS fdbserver DESTINATION sbin COMPONENT server)
-else()
-  add_custom_target(prepare_fdbserver_install ALL DEPENDS strip_only_fdbserver)
-  fdb_install(PROGRAMS ${CMAKE_BINARY_DIR}/packages/bin/fdbserver DESTINATION sbin COMPONENT server)
+if(NOT OPEN_FOR_IDE)
+  if(GENERATE_DEBUG_PACKAGES)
+    fdb_install(TARGETS fdbserver DESTINATION sbin COMPONENT server)
+  else()
+    add_custom_target(prepare_fdbserver_install ALL DEPENDS strip_only_fdbserver)
+    fdb_install(PROGRAMS ${CMAKE_BINARY_DIR}/packages/bin/fdbserver DESTINATION sbin COMPONENT server)
+  endif()
 endif()

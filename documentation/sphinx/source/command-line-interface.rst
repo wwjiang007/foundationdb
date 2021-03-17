@@ -313,7 +313,7 @@ client
 
 ``profile client <get|set>``
 
-Reads or sets parameters of client transaction sampling. Use ``get`` to list the current parameters, and ``set <RATE|default> <SIZE|default>`` to set them. ``RATE`` is the fraction of transactions to be sampled, and ``SIZE`` is the amount (in bytes) of sampled data to store in the database.
+Reads or sets parameters of client transaction sampling. Use ``get`` to list the current parameters, and ``set <RATE|default> <SIZE|default>`` to set them. ``RATE`` is the fraction of transactions to be sampled, and ``SIZE`` is the amount (in bytes) of sampled data to store in the database. For more information, see :doc:`transaction-profiler-analyzer`.
 
 list
 ^^^^
@@ -473,6 +473,11 @@ Prints a list of currently active transaction tag throttles, or recommended tran
 ``all`` - list both active and recommended transaction tag throttles.
 
 ``LIMIT`` - The number of throttles to print. Defaults to 100.
+
+triggerddteaminfolog
+--------------------
+
+The ``triggerddteaminfolog`` command would trigger the data distributor to log very detailed teams information into trace event logs.
 
 unlock
 ------

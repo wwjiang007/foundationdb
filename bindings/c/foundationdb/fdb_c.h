@@ -45,12 +45,17 @@
 #define WARN_UNUSED_RESULT
 #endif
 
-// With default settings, gcc will not warn about unprototyped functions being called, so it
-// is easy to erroneously call a function which is not available at FDB_API_VERSION and then
-// get an error only at runtime.  These macros ensure a compile error in such cases, and
-// attempt to make the compile error slightly informative.
-#define This_FoundationDB_API_function_is_removed_at_this_FDB_API_VERSION() [=====]
-#define FDB_REMOVED_FUNCTION This_FoundationDB_API_function_is_removed_at_this_FDB_API_VERSION(0)
+/*
+ * With default settings, gcc will not warn about unprototyped functions being
+ * called, so it is easy to erroneously call a function which is not available
+ * at FDB_API_VERSION and then get an error only at runtime.  These macros
+ * ensure a compile error in such cases, and attempt to make the compile error
+ * slightly informative.
+ */
+#define This_FoundationDB_API_function_is_removed_at_this_FDB_API_VERSION()    \
+  [== == = ]
+#define FDB_REMOVED_FUNCTION                                                   \
+  This_FoundationDB_API_function_is_removed_at_this_FDB_API_VERSION(0)
 
 #include <stdint.h>
 
@@ -137,6 +142,9 @@ extern "C" {
     fdb_future_get_int64( FDBFuture* f, int64_t* out );
 
     DLLEXPORT WARN_UNUSED_RESULT fdb_error_t
+    fdb_future_get_uint64( FDBFuture* f, uint64_t* out );
+
+    DLLEXPORT WARN_UNUSED_RESULT fdb_error_t
     fdb_future_get_key( FDBFuture* f, uint8_t const** out_key,
                         int* out_key_length );
 
@@ -169,6 +177,18 @@ extern "C" {
     DLLEXPORT WARN_UNUSED_RESULT fdb_error_t
     fdb_database_create_transaction( FDBDatabase* d,
                                      FDBTransaction** out_transaction );
+
+    DLLEXPORT WARN_UNUSED_RESULT FDBFuture*
+    fdb_database_reboot_worker( FDBDatabase* db, uint8_t const* address,
+                                int address_length, fdb_bool_t check, int duration);
+    
+    DLLEXPORT WARN_UNUSED_RESULT FDBFuture*
+    fdb_database_force_recovery_with_data_loss( FDBDatabase* db, uint8_t const* dcid, int dcid_length);
+
+    DLLEXPORT WARN_UNUSED_RESULT FDBFuture*
+    fdb_database_create_snapshot(FDBDatabase *db, uint8_t const *uid,
+                                    int uid_length, uint8_t const *snap_command,
+                                    int snap_command_length);
 
     DLLEXPORT void fdb_transaction_destroy( FDBTransaction* tr);
 
@@ -241,12 +261,18 @@ extern "C" {
     fdb_transaction_get_committed_version( FDBTransaction* tr,
                                            int64_t* out_version );
 
-    // This function intentionally returns an FDBFuture instead of an integer directly,
-    // so that calling this API can see the effect of previous mutations on the transaction.
-    // Specifically, mutations are applied asynchronously by the main thread. In order to
-    // see them, this call has to be serviced by the main thread too.
+    /*
+     * This function intentionally returns an FDBFuture instead of an integer
+     * directly, so that calling this API can see the effect of previous
+     * mutations on the transaction. Specifically, mutations are applied
+     * asynchronously by the main thread. In order to see them, this call has to
+     * be serviced by the main thread too.
+     */
+    DLLEXPORT WARN_UNUSED_RESULT FDBFuture *
+    fdb_transaction_get_approximate_size(FDBTransaction *tr);
+
     DLLEXPORT WARN_UNUSED_RESULT FDBFuture*
-    fdb_transaction_get_approximate_size(FDBTransaction* tr);
+    fdb_get_server_protocol(const char* clusterFilePath);
 
     DLLEXPORT WARN_UNUSED_RESULT FDBFuture* fdb_transaction_get_versionstamp( FDBTransaction* tr );
 
@@ -295,7 +321,7 @@ extern "C" {
     typedef struct FDB_cluster FDBCluster;
 
     typedef enum {
-        // This option is only a placeholder for C compatibility and should not be used
+        /* This option is only a placeholder for C compatibility and should not be used */
         FDB_CLUSTER_OPTION_DUMMY_DO_NOT_USE=-1
     } FDBClusterOption;
 #endif

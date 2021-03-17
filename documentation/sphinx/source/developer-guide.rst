@@ -866,7 +866,7 @@ Some of this information is also available in ``\xff\xff/status/json``, but thes
   >>> for k, v in db.get_range_startswith('\xff\xff/metrics/health/'):
   ...     print(k, v)
   ...
-  ('\xff\xff/metrics/health/aggregate', '{"batch_limited":false,"tps_limit":483988.66315011407,"worst_storage_durability_lag":5000001,"worst_storage_queue":2036,"worst_log_queue":300}')
+  ('\xff\xff/metrics/health/aggregate', '{"batch_limited":false,"limiting_storage_durability_lag":5000000,"limiting_storage_queue":1000,"tps_limit":483988.66315011407,"worst_storage_durability_lag":5000001,"worst_storage_queue":2036,"worst_log_queue":300}')
   ('\xff\xff/metrics/health/log/e639a9ad0373367784cc550c615c469b', '{"log_queue":300}')
   ('\xff\xff/metrics/health/storage/ab2ce4caf743c9c1ae57063629c6678a', '{"cpu_usage":2.398696781487125,"disk_usage":0.059995917598039405,"storage_durability_lag":5000001,"storage_queue":2036}')
 
@@ -874,15 +874,17 @@ Some of this information is also available in ``\xff\xff/status/json``, but thes
 
 Aggregate stats about cluster health. Reading this key alone is slightly cheaper than reading any of the per-process keys.
 
-============================ ======== ===============
-**Field**                    **Type** **Description**
----------------------------- -------- ---------------
-batch_limited                boolean  Whether or not the cluster is limiting batch priority transactions
-tps_limit                    number   The rate at which normal priority transactions are allowed to start
-worst_storage_durability_lag number   See the description for storage_durability_lag
-worst_storage_queue          number   See the description for storage_queue
-worst_log_queue              number   See the description for log_queue
-============================ ======== ===============
+=================================== ======== ===============
+**Field**                           **Type** **Description**
+----------------------------------- -------- ---------------
+batch_limited                       boolean  Whether or not the cluster is limiting batch priority transactions
+limiting_storage_durability_lag     number   storage_durability_lag that ratekeeper is using to determing throttling (see the description for storage_durability_lag)
+limiting_storage_queue              number   storage_queue that ratekeeper is using to determing throttling (see the description for storage_queue)
+tps_limit                           number   The rate at which normal priority transactions are allowed to start
+worst_storage_durability_lag        number   See the description for storage_durability_lag
+worst_storage_queue                 number   See the description for storage_queue
+worst_log_queue                     number   See the description for log_queue
+=================================== ======== ===============
 
 ``\xff\xff/metrics/health/log/<id>``
 
@@ -945,6 +947,8 @@ that process, and wait for necessary data to be moved away.
 #. ``\xff\xff/management/in_progress_exclusion/<address>`` Read-only. Indicates that the process matching ``<address>`` matches an exclusion, but still has necessary data and can't yet be safely removed.
 #. ``\xff\xff/management/options/excluded/force`` Read/write. Setting this key disables safety checks for writes to ``\xff\xff/management/excluded/<exclusion>``. Setting this key only has an effect in the current transaction and is not persisted on commit.
 #. ``\xff\xff/management/options/failed/force`` Read/write. Setting this key disables safety checks for writes to ``\xff\xff/management/failed/<exclusion>``. Setting this key only has an effect in the current transaction and is not persisted on commit.
+#. ``\xff\xff/management/min_required_commit_version`` Read/write. Changing this key will change the corresponding system key ``\xff/minRequiredCommitVersion = [[Version]]``. The value of this special key is the literal text of the underlying ``Version``, which is ``int64_t``. If you set the key with a value failed to be parsed as ``int64_t``, ``special_keys_api_failure`` will be thrown. In addition, the given ``Version`` should be larger than the current read version and smaller than the upper bound(``2**63-1-version_per_second*3600*24*365*1000``). Otherwise, ``special_keys_api_failure`` is thrown. For more details, see help text of ``fdbcli`` command ``advanceversion``.
+#. ``\xff\xff/management/profiling/<client_txn_sample_rate|client_txn_size_limit>`` Read/write. Changing these two keys will change the corresponding system keys ``\xff\x02/fdbClientInfo/<client_txn_sample_rate|client_txn_size_limit>``, respectively. The value of ``\xff\xff/management/client_txn_sample_rate`` is a literal text of ``double``, and the value of ``\xff\xff/management/client_txn_size_limit`` is a literal text of ``int64_t``. A special value ``default`` can be set to or read from these two keys, representing the client profiling is disabled. In addition, ``clear`` in this range is not allowed. For more details, see help text of ``fdbcli`` command ``profile client``.
 
 An exclusion is syntactically either an ip address (e.g. ``127.0.0.1``), or
 an ip address and port (e.g. ``127.0.0.1:4500``). If no port is specified,
