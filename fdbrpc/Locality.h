@@ -34,7 +34,6 @@ struct ProcessClass {
 		ResolutionClass,
 		TesterClass,
 		CommitProxyClass,
-		GrvProxyClass,
 		MasterClass,
 		StatelessClass,
 		LogClass,
@@ -46,6 +45,7 @@ struct ProcessClass {
 		RatekeeperClass,
 		StorageCacheClass,
 		BackupClass,
+		GrvProxyClass,
 		InvalidClass = -1
 	};
 
@@ -308,7 +308,19 @@ public:
 		}
 	}
 
+	std::map<std::string, std::string> getAllData() const {
+		std::map<std::string, std::string> data;
+		for (const auto& d : _data) {
+			if (d.second.present()) {
+				data[d.first.toString()] = d.second.get().toString();
+			}
+		}
+		return data;
+	}
+
 	static const UID UNSET_ID;
+	static const StringRef ExcludeLocalityKeyMachineIdPrefix;
+	static const StringRef ExcludeLocalityPrefix;
 };
 
 static std::string describe(std::vector<LocalityData> const& items, StringRef const key, int max_items = -1) {

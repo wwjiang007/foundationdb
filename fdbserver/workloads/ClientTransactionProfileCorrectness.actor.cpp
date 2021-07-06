@@ -1,7 +1,29 @@
+/*
+ * ClientTransactionProfileCorrectness.actor.cpp
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "fdbserver/workloads/workloads.actor.h"
 #include "fdbserver/ServerDBInfo.h"
+#include "fdbclient/GlobalConfig.actor.h"
 #include "fdbclient/ManagementAPI.actor.h"
 #include "fdbclient/RunTransaction.actor.h"
+#include "fdbclient/Tuple.h"
 #include "flow/actorcompiler.h" // has to be last include
 
 static const Key CLIENT_LATENCY_INFO_PREFIX = LiteralStringRef("client_latency/");
@@ -196,7 +218,8 @@ struct ClientTransactionProfileCorrectnessWorkload : TestWorkload {
 
 	Future<Void> setup(Database const& cx) override {
 		if (clientId == 0) {
-			globalClientKnobs->CSI_STATUS_DELAY = 2.0; // 2 seconds
+			IKnobCollection::getMutableGlobalKnobCollection().setKnob("csi_status_delay",
+			                                                          KnobValueRef::create(double{ 2.0 })); // 2 seconds
 			return changeProfilingParameters(cx, trInfoSizeLimit, samplingProbability);
 		}
 		return Void();
@@ -216,7 +239,7 @@ struct ClientTransactionProfileCorrectnessWorkload : TestWorkload {
 
 	std::string getTrId(KeyRef key) const { return key.substr(trIdStartIndex, trIdFormatSize).toString(); }
 
-	bool checkTxInfoEntriesFormat(const Standalone<RangeResultRef>& txInfoEntries) {
+	bool checkTxInfoEntriesFormat(const RangeResult& txInfoEntries) {
 		std::string val;
 		std::map<std::string, std::vector<ValueRef>> trInfoChunks;
 		for (auto kv : txInfoEntries) {
@@ -269,10 +292,12 @@ struct ClientTransactionProfileCorrectnessWorkload : TestWorkload {
 	ACTOR Future<Void> changeProfilingParameters(Database cx, int64_t sizeLimit, double sampleProbability) {
 
 		wait(runRYWTransaction(cx, [=](Reference<ReadYourWritesTransaction> tr) -> Future<Void> {
-			tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr->setOption(FDBTransactionOptions::SPECIAL_KEY_SPACE_ENABLE_WRITES);
 			tr->setOption(FDBTransactionOptions::LOCK_AWARE);
-			tr->set(fdbClientInfoTxnSampleRate, BinaryWriter::toValue(sampleProbability, Unversioned()));
-			tr->set(fdbClientInfoTxnSizeLimit, BinaryWriter::toValue(sizeLimit, Unversioned()));
+			Tuple rate = Tuple().appendDouble(sampleProbability);
+			Tuple size = Tuple().append(sizeLimit);
+			tr->set(GlobalConfig::prefixedKey(fdbClientInfoTxnSampleRate), rate.pack());
+			tr->set(GlobalConfig::prefixedKey(fdbClientInfoTxnSizeLimit), size.pack());
 			return Void();
 		}));
 		return Void();
@@ -285,7 +310,7 @@ struct ClientTransactionProfileCorrectnessWorkload : TestWorkload {
 
 		state Key clientLatencyAtomicCtr = CLIENT_LATENCY_INFO_CTR_PREFIX.withPrefix(fdbClientInfoPrefixRange.begin);
 		state int64_t counter;
-		state Standalone<RangeResultRef> txInfoEntries;
+		state RangeResult txInfoEntries;
 		Optional<Value> ctrValue =
 		    wait(runRYWTransaction(cx, [=](Reference<ReadYourWritesTransaction> tr) -> Future<Optional<Value>> {
 			    tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
@@ -304,7 +329,7 @@ struct ClientTransactionProfileCorrectnessWorkload : TestWorkload {
 			try {
 				tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-				state Standalone<RangeResultRef> kvRange = wait(tr.getRange(begin, end, keysLimit));
+				state RangeResult kvRange = wait(tr.getRange(begin, end, keysLimit));
 				if (kvRange.empty())
 					break;
 				txInfoEntries.arena().dependsOn(kvRange.arena());

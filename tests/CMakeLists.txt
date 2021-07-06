@@ -15,7 +15,7 @@ set(TEST_EXCLUDE ".^" CACHE STRING "Exclude all tests matching the given regex")
 if(WITH_PYTHON)
   find_program(OLD_FDBSERVER_BINARY
     fdbserver
-    HINTS /usr/sbin /usr/libexec /usr/local/sbin /usr/local/libexec)
+    HINTS /opt/foundationdb/old /usr/sbin /usr/libexec /usr/local/sbin /usr/local/libexec)
   if(OLD_FDBSERVER_BINARY)
     message(STATUS "Use old fdb at ${OLD_FDBSERVER_BINARY}")
   else()
@@ -62,6 +62,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES PureNetwork.txt IGNORE)
   add_fdb_test(TEST_FILES RRW2500.txt IGNORE)
   add_fdb_test(TEST_FILES RandomRead.txt IGNORE)
+  add_fdb_test(TEST_FILES RandomRangeRead.txt IGNORE)
   add_fdb_test(TEST_FILES RandomReadWrite.txt IGNORE)
   add_fdb_test(TEST_FILES ReadAbsent.txt IGNORE)
   add_fdb_test(TEST_FILES ReadAfterWrite.txt IGNORE)
@@ -74,6 +75,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES RedwoodPerfSet.txt IGNORE)
   add_fdb_test(TEST_FILES RedwoodPerfPrefixCompression.txt IGNORE)
   add_fdb_test(TEST_FILES RedwoodPerfSequentialInsert.txt IGNORE)
+  add_fdb_test(TEST_FILES RedwoodPerfRandomRangeScans.txt IGNORE)
   add_fdb_test(TEST_FILES RocksDBTest.txt IGNORE)
   add_fdb_test(TEST_FILES S3BlobStore.txt IGNORE)
   add_fdb_test(TEST_FILES SampleNoSimAttrition.txt IGNORE)
@@ -85,7 +87,11 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES SlowTask.txt IGNORE)
   add_fdb_test(TEST_FILES SpecificUnitTest.txt IGNORE)
   add_fdb_test(TEST_FILES StorageMetricsSampleTests.txt IGNORE)
+  add_fdb_test(TEST_FILES WorkerTests.txt IGNORE)
+  add_fdb_test(TEST_FILES ClusterControllerTests.txt IGNORE)
+  add_fdb_test(TEST_FILES StorageServerInterface.txt)
   add_fdb_test(TEST_FILES StreamingWrite.txt IGNORE)
+  add_fdb_test(TEST_FILES SystemData.txt)
   add_fdb_test(TEST_FILES ThreadSafety.txt IGNORE)
   add_fdb_test(TEST_FILES TraceEventMetrics.txt IGNORE)
   add_fdb_test(TEST_FILES PopulateTPCC.txt IGNORE)
@@ -151,6 +157,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES fast/Watches.toml)
   add_fdb_test(TEST_FILES fast/WriteDuringRead.toml)
   add_fdb_test(TEST_FILES fast/WriteDuringReadClean.toml)
+  add_fdb_test(TEST_FILES noSim/RandomUnitTests.toml UNIT)
   add_fdb_test(TEST_FILES rare/CheckRelocation.toml)
   add_fdb_test(TEST_FILES rare/ClogUnclog.toml)
   add_fdb_test(TEST_FILES rare/CloggedCycleWithKills.toml)
@@ -184,17 +191,17 @@ if(WITH_PYTHON)
     TEST_FILES restarting/from_5.0.0/StorefrontTestRestart-1.txt
                restarting/from_5.0.0/StorefrontTestRestart-2.txt)
   add_fdb_test(
-    TEST_FILES restarting/from_6.2.29/SnapTestAttrition-1.txt
-               restarting/from_6.2.29/SnapTestAttrition-2.txt)
+    TEST_FILES restarting/from_6.2.33/SnapTestAttrition-1.txt
+               restarting/from_6.2.33/SnapTestAttrition-2.txt)
   add_fdb_test(
-    TEST_FILES restarting/from_6.2.29/SnapTestSimpleRestart-1.txt
-               restarting/from_6.2.29/SnapTestSimpleRestart-2.txt)
+    TEST_FILES restarting/from_6.2.33/SnapTestSimpleRestart-1.txt
+               restarting/from_6.2.33/SnapTestSimpleRestart-2.txt)
   add_fdb_test(
-    TEST_FILES restarting/from_6.2.29/SnapTestRestart-1.txt
-               restarting/from_6.2.29/SnapTestRestart-2.txt)
+    TEST_FILES restarting/from_6.2.33/SnapTestRestart-1.txt
+               restarting/from_6.2.33/SnapTestRestart-2.txt)
   add_fdb_test(
-    TEST_FILES restarting/from_6.2.29/SnapCycleRestart-1.txt
-               restarting/from_6.2.29/SnapCycleRestart-2.txt)
+    TEST_FILES restarting/from_6.2.33/SnapCycleRestart-1.txt
+               restarting/from_6.2.33/SnapCycleRestart-2.txt)
   add_fdb_test(
     TEST_FILES restarting/from_5.1.7/DrUpgradeRestart-1.txt
                restarting/from_5.1.7/DrUpgradeRestart-2.txt)
@@ -261,6 +268,16 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES status/separate_not_enough_servers.txt)
   add_fdb_test(TEST_FILES status/single_process_too_many_config_params.txt)
 
+  if(NOT OPEN_FOR_IDE)
+    add_test(
+      NAME multiversion_client/unit_tests
+      COMMAND $<TARGET_FILE:fdbserver> -r unittests -f /fdbclient/multiversionclient/
+    )
+    add_test(
+      NAME threadsafe_threadfuture_to_future/unit_tests
+      COMMAND $<TARGET_FILE:fdbserver> -r unittests -f /flow/safeThreadFutureToFuture/
+    )
+  endif()
 
   verify_testing()
   if (NOT OPEN_FOR_IDE AND NOT WIN32)

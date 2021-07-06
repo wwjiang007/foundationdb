@@ -35,8 +35,8 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/interprocess/managed_shared_memory.hpp>
 
+#include "fdbclient/IKnobCollection.h"
 #include "fdbclient/NativeAPI.actor.h"
-#include "fdbclient/RestoreWorkerInterface.actor.h"
 #include "fdbclient/SystemData.h"
 #include "fdbclient/versions.h"
 #include "fdbclient/BuildFlags.h"
@@ -52,6 +52,7 @@
 #include "fdbserver/IKeyValueStore.h"
 #include "fdbserver/MoveKeys.actor.h"
 #include "fdbserver/NetworkTest.h"
+#include "fdbserver/RestoreWorkerInterface.actor.h"
 #include "fdbserver/ServerDBInfo.h"
 #include "fdbserver/SimulatedCluster.h"
 #include "fdbserver/Status.h"
@@ -66,6 +67,7 @@
 #include "flow/SystemMonitor.h"
 #include "flow/TLSConfig.actor.h"
 #include "flow/Tracing.h"
+#include "flow/UnitTest.h"
 
 #if defined(__linux__) || defined(__FreeBSD__)
 #include <execinfo.h>
@@ -88,9 +90,9 @@ enum {
 	OPT_CONNFILE, OPT_SEEDCONNFILE, OPT_SEEDCONNSTRING, OPT_ROLE, OPT_LISTEN, OPT_PUBLICADDR, OPT_DATAFOLDER, OPT_LOGFOLDER, OPT_PARENTPID, OPT_TRACER, OPT_NEWCONSOLE,
 	OPT_NOBOX, OPT_TESTFILE, OPT_RESTARTING, OPT_RESTORING, OPT_RANDOMSEED, OPT_KEY, OPT_MEMLIMIT, OPT_STORAGEMEMLIMIT, OPT_CACHEMEMLIMIT, OPT_MACHINEID,
 	OPT_DCID, OPT_MACHINE_CLASS, OPT_BUGGIFY, OPT_VERSION, OPT_BUILD_FLAGS, OPT_CRASHONERROR, OPT_HELP, OPT_NETWORKIMPL, OPT_NOBUFSTDOUT, OPT_BUFSTDOUTERR,
-	OPT_TRACECLOCK, OPT_NUMTESTERS, OPT_DEVHELP, OPT_ROLLSIZE, OPT_MAXLOGS, OPT_MAXLOGSSIZE, OPT_KNOB, OPT_TESTSERVERS, OPT_TEST_ON_SERVERS, OPT_METRICSCONNFILE,
+	OPT_TRACECLOCK, OPT_NUMTESTERS, OPT_DEVHELP, OPT_ROLLSIZE, OPT_MAXLOGS, OPT_MAXLOGSSIZE, OPT_KNOB, OPT_UNITTESTPARAM, OPT_TESTSERVERS, OPT_TEST_ON_SERVERS, OPT_METRICSCONNFILE,
 	OPT_METRICSPREFIX, OPT_LOGGROUP, OPT_LOCALITY, OPT_IO_TRUST_SECONDS, OPT_IO_TRUST_WARN_ONLY, OPT_FILESYSTEM, OPT_PROFILER_RSS_SIZE, OPT_KVFILE,
-	OPT_TRACE_FORMAT, OPT_WHITELIST_BINPATH, OPT_BLOB_CREDENTIAL_FILE
+	OPT_TRACE_FORMAT, OPT_WHITELIST_BINPATH, OPT_BLOB_CREDENTIAL_FILE, OPT_CONFIG_PATH, OPT_USE_TEST_CONFIG_DB,
 };
 
 CSimpleOpt::SOption g_rgOptions[] = {
@@ -162,6 +164,7 @@ CSimpleOpt::SOption g_rgOptions[] = {
 	{ OPT_HELP,                  "--help",                      SO_NONE },
 	{ OPT_DEVHELP,               "--dev-help",                  SO_NONE },
 	{ OPT_KNOB,                  "--knob_",                     SO_REQ_SEP },
+	{ OPT_UNITTESTPARAM,         "--test_",                     SO_REQ_SEP },
 	{ OPT_LOCALITY,              "--locality_",                 SO_REQ_SEP },
 	{ OPT_TESTSERVERS,           "--testservers",               SO_REQ_SEP },
 	{ OPT_TEST_ON_SERVERS,       "--testonservers",             SO_NONE },
@@ -172,6 +175,8 @@ CSimpleOpt::SOption g_rgOptions[] = {
 	{ OPT_TRACE_FORMAT      ,    "--trace_format",              SO_REQ_SEP },
 	{ OPT_WHITELIST_BINPATH,     "--whitelist_binpath",         SO_REQ_SEP },
 	{ OPT_BLOB_CREDENTIAL_FILE,  "--blob_credential_file",      SO_REQ_SEP },
+	{ OPT_CONFIG_PATH,           "--config_path",               SO_REQ_SEP },
+	{ OPT_USE_TEST_CONFIG_DB,    "--use_test_config_db",        SO_NONE },
 
 #ifndef TLS_DISABLED
 	TLS_OPTION_FLAGS
@@ -429,7 +434,7 @@ ACTOR Future<Void> dumpDatabase(Database cx, std::string outputFilename, KeyRang
 				fprintf(output, "<h3>Database version: %" PRId64 "</h3>", ver);
 
 				loop {
-					Standalone<RangeResultRef> results = wait(tr.getRange(iter, firstGreaterOrEqual(range.end), 1000));
+					RangeResult results = wait(tr.getRange(iter, firstGreaterOrEqual(range.end), 1000));
 					for (int r = 0; r < results.size(); r++) {
 						std::string key = toHTML(results[r].key), value = toHTML(results[r].value);
 						fprintf(output, "<p>%s <b>:=</b> %s</p>\n", key.c_str(), value.c_str());
@@ -464,7 +469,7 @@ Future<Void> startSystemMonitor(std::string dataFolder,
 	    SystemMonitorMachineState(dataFolder, dcId, zoneId, machineId, g_network->getLocalAddress().ip));
 
 	systemMonitor();
-	return recurring(&systemMonitor, 5.0, TaskPriority::FlushTrace);
+	return recurring(&systemMonitor, SERVER_KNOBS->SYSTEM_MONITOR_FREQUENCY, TaskPriority::FlushTrace);
 }
 
 void testIndexedSet();
@@ -622,16 +627,19 @@ static void printUsage(const char* name, bool devhelp) {
 	printOptionUsage("-h, -?, --help", "Display this help and exit.");
 	if (devhelp) {
 		printf("  --build_flags  Print build information and exit.\n");
-		printOptionUsage("-r ROLE, --role ROLE",
-		                 " Server role (valid options are fdbd, test, multitest,"
-		                 " simulation, networktestclient, networktestserver, restore"
-		                 " consistencycheck, kvfileintegritycheck, kvfilegeneratesums). The default is `fdbd'.");
+		printOptionUsage(
+		    "-r ROLE, --role ROLE",
+		    " Server role (valid options are fdbd, test, multitest,"
+		    " simulation, networktestclient, networktestserver, restore"
+		    " consistencycheck, kvfileintegritycheck, kvfilegeneratesums, unittests). The default is `fdbd'.");
 #ifdef _WIN32
 		printOptionUsage("-n, --newconsole", " Create a new console.");
 		printOptionUsage("-q, --no_dialog", " Disable error dialog on crash.");
 		printOptionUsage("--parentpid PID", " Specify a process after whose termination to exit.");
 #endif
-		printOptionUsage("-f TESTFILE, --testfile", " Testfile to run, defaults to `tests/default.txt'.");
+		printOptionUsage("-f TESTFILE, --testfile",
+		                 " Testfile to run, defaults to `tests/default.txt'.  If role is `unittests', specifies which "
+		                 "unit tests to run as a search prefix.");
 		printOptionUsage("-R, --restarting", " Restart a previous simulation that was cleanly shut down.");
 		printOptionUsage("-s SEED, --seed SEED", " Random seed.");
 		printOptionUsage("-k KEY, --key KEY", "Target key for search role.");
@@ -651,6 +659,8 @@ static void printUsage(const char* name, bool devhelp) {
 		printOptionUsage("--num_testers NUM",
 		                 " A multitester will wait for NUM testers before starting"
 		                 " (defaults to 1).");
+		printOptionUsage("--test_PARAMNAME PARAMVALUE",
+		                 " Set a UnitTest named parameter to the given value.  Names are case sensitive.");
 #ifdef __linux__
 		printOptionUsage("--rsssize SIZE",
 		                 " Turns on automatic heap profiling when RSS memory size exceeds"
@@ -922,6 +932,7 @@ enum class ServerRole {
 	SkipListTest,
 	Test,
 	VersionedMapTest,
+	UnitTests
 };
 struct CLIOptions {
 	std::string commandLine;
@@ -946,7 +957,7 @@ struct CLIOptions {
 	NetworkAddressList publicAddresses, listenAddresses;
 
 	const char* targetKey = nullptr;
-	uint64_t memLimit =
+	int64_t memLimit =
 	    8LL << 30; // Nice to maintain the same default value for memLimit and SERVER_KNOBS->SERVER_MEM_LIMIT and
 	               // SERVER_KNOBS->COMMIT_BATCHES_MEM_BYTES_HARD_LIMIT
 	uint64_t storageMemLimit = 1LL << 30;
@@ -957,6 +968,7 @@ struct CLIOptions {
 	bool useNet2 = true;
 	bool useThreadPool = false;
 	std::vector<std::pair<std::string, std::string>> knobs;
+	std::map<std::string, std::string> manualKnobOverrides;
 	LocalityData localities;
 	int minTesterCount = 1;
 	bool testOnServers = false;
@@ -968,8 +980,12 @@ struct CLIOptions {
 	std::vector<std::string> blobCredentials; // used for fast restore workers & backup workers
 	const char* blobCredsFromENV = nullptr;
 
+	std::string configPath;
+	UseConfigDB useConfigDB{ UseConfigDB::DISABLED };
+
 	Reference<ClusterConnectionFile> connectionFile;
 	Standalone<StringRef> machineId;
+	UnitTestParameters testParams;
 
 	static CLIOptions parseArgs(int argc, char* argv[]) {
 		CLIOptions opts;
@@ -1041,7 +1057,17 @@ private:
 					flushAndExit(FDB_EXIT_ERROR);
 				}
 				syn = syn.substr(7);
-				knobs.push_back(std::make_pair(syn, args.OptionArg()));
+				knobs.emplace_back(syn, args.OptionArg());
+				manualKnobOverrides[syn] = args.OptionArg();
+				break;
+			}
+			case OPT_UNITTESTPARAM: {
+				std::string syn = args.OptionSyntax();
+				if (!StringRef(syn).startsWith(LiteralStringRef("--test_"))) {
+					fprintf(stderr, "ERROR: unable to parse knob option '%s'\n", syn.c_str());
+					flushAndExit(FDB_EXIT_ERROR);
+				}
+				testParams.set(syn.substr(7), args.OptionArg());
 				break;
 			}
 			case OPT_LOCALITY: {
@@ -1102,6 +1128,8 @@ private:
 					role = ServerRole::KVFileGenerateIOLogChecksums;
 				else if (!strcmp(sRole, "consistencycheck"))
 					role = ServerRole::ConsistencyCheck;
+				else if (!strcmp(sRole, "unittests"))
+					role = ServerRole::UnitTests;
 				else {
 					fprintf(stderr, "ERROR: Unknown role `%s'\n", sRole);
 					printHelpTeaser(argv[0]);
@@ -1339,10 +1367,10 @@ private:
 				}
 				// SOMEDAY: ideally we'd have some better way to express that a knob should be elevated to formal
 				// parameter
-				knobs.push_back(std::make_pair(
+				knobs.emplace_back(
 				    "page_cache_4k",
-				    format("%ld", ti.get() / 4096 * 4096))); // The cache holds 4K pages, so we can truncate this to the
-				                                             // next smaller multiple of 4K.
+				    format("%ld", ti.get() / 4096 * 4096)); // The cache holds 4K pages, so we can truncate this to the
+				                                            // next smaller multiple of 4K.
 				break;
 			case OPT_BUGGIFY:
 				if (!strcmp(args.OptionArg(), "on"))
@@ -1409,6 +1437,12 @@ private:
 					} while (t.size() != 0);
 				}
 				break;
+			case OPT_CONFIG_PATH:
+				configPath = args.OptionArg();
+				break;
+			case OPT_USE_TEST_CONFIG_DB:
+				useConfigDB = UseConfigDB::SIMPLE;
+				break;
 
 #ifndef TLS_DISABLED
 			case TLSConfig::OPT_TLS_PLUGIN:
@@ -1461,7 +1495,8 @@ private:
 			    return StringRef(addr).startsWith(LiteralStringRef("auto:"));
 		    });
 		if ((role != ServerRole::Simulation && role != ServerRole::CreateTemplateDatabase &&
-		     role != ServerRole::KVFileIntegrityCheck && role != ServerRole::KVFileGenerateIOLogChecksums) ||
+		     role != ServerRole::KVFileIntegrityCheck && role != ServerRole::KVFileGenerateIOLogChecksums &&
+		     role != ServerRole::UnitTests) ||
 		    autoPublicAddress) {
 
 			if (seedSpecified && !fileExists(connFile)) {
@@ -1484,7 +1519,7 @@ private:
 					fprintf(stderr, "%s\n", ClusterConnectionString::getErrorString(connectionString, e).c_str());
 					throw;
 				}
-				auto connectionFile = makeReference<ClusterConnectionFile>(connFile, ccs);
+				connectionFile = makeReference<ClusterConnectionFile>(connFile, ccs);
 			} else {
 				std::pair<std::string, bool> resolvedClusterFile;
 				try {
@@ -1605,46 +1640,44 @@ int main(int argc, char* argv[]) {
 
 		enableBuggify(opts.buggifyEnabled, BuggifyType::General);
 
-		if (!globalServerKnobs->setKnob("log_directory", opts.logFolder))
-			ASSERT(false);
+		IKnobCollection::setGlobalKnobCollection(IKnobCollection::Type::SERVER,
+		                                         Randomize::YES,
+		                                         role == ServerRole::Simulation ? IsSimulated::YES : IsSimulated::NO);
+		IKnobCollection::getMutableGlobalKnobCollection().setKnob("log_directory", KnobValue::create(opts.logFolder));
 		if (role != ServerRole::Simulation) {
-			if (!globalServerKnobs->setKnob("commit_batches_mem_bytes_hard_limit", std::to_string(opts.memLimit)))
-				ASSERT(false);
+			IKnobCollection::getMutableGlobalKnobCollection().setKnob("commit_batches_mem_bytes_hard_limit",
+			                                                          KnobValue::create(int64_t{ opts.memLimit }));
 		}
-		for (auto k = opts.knobs.begin(); k != opts.knobs.end(); ++k) {
+
+		for (const auto& [knobName, knobValueString] : opts.knobs) {
 			try {
-				if (!globalFlowKnobs->setKnob(k->first, k->second) &&
-				    !globalClientKnobs->setKnob(k->first, k->second) &&
-				    !globalServerKnobs->setKnob(k->first, k->second)) {
-					fprintf(stderr, "WARNING: Unrecognized knob option '%s'\n", k->first.c_str());
-					TraceEvent(SevWarnAlways, "UnrecognizedKnobOption").detail("Knob", printable(k->first));
-				}
+				auto& g_knobs = IKnobCollection::getMutableGlobalKnobCollection();
+				auto knobValue = g_knobs.parseKnobValue(knobName, knobValueString);
+				g_knobs.setKnob(knobName, knobValue);
 			} catch (Error& e) {
 				if (e.code() == error_code_invalid_option_value) {
 					fprintf(stderr,
 					        "WARNING: Invalid value '%s' for knob option '%s'\n",
-					        k->second.c_str(),
-					        k->first.c_str());
+					        knobName.c_str(),
+					        knobValueString.c_str());
 					TraceEvent(SevWarnAlways, "InvalidKnobValue")
-					    .detail("Knob", printable(k->first))
-					    .detail("Value", printable(k->second));
+					    .detail("Knob", printable(knobName))
+					    .detail("Value", printable(knobValueString));
 				} else {
-					fprintf(stderr, "ERROR: Failed to set knob option '%s': %s\n", k->first.c_str(), e.what());
+					fprintf(stderr, "ERROR: Failed to set knob option '%s': %s\n", knobName.c_str(), e.what());
 					TraceEvent(SevError, "FailedToSetKnob")
-					    .detail("Knob", printable(k->first))
-					    .detail("Value", printable(k->second))
+					    .detail("Knob", printable(knobName))
+					    .detail("Value", printable(knobValueString))
 					    .error(e);
 					throw;
 				}
 			}
 		}
-		if (!globalServerKnobs->setKnob("server_mem_limit", std::to_string(opts.memLimit)))
-			ASSERT(false);
-
+		IKnobCollection::getMutableGlobalKnobCollection().setKnob("server_mem_limit",
+		                                                          KnobValue::create(int64_t{ opts.memLimit }));
 		// Reinitialize knobs in order to update knobs that are dependent on explicitly set knobs
-		globalFlowKnobs->initialize(true, role == ServerRole::Simulation);
-		globalClientKnobs->initialize(true);
-		globalServerKnobs->initialize(true, globalClientKnobs.get(), role == ServerRole::Simulation);
+		IKnobCollection::getMutableGlobalKnobCollection().initialize(
+		    Randomize::YES, role == ServerRole::Simulation ? IsSimulated::YES : IsSimulated::NO);
 
 		// evictionPolicyStringToEnum will throw an exception if the string is not recognized as a valid
 		EvictablePageCache::evictionPolicyStringToEnum(FLOW_KNOBS->CACHE_EVICTION_POLICY);
@@ -1764,21 +1797,6 @@ int main(int argc, char* argv[]) {
 		    .detail("BuggifyEnabled", opts.buggifyEnabled)
 		    .detail("MemoryLimit", opts.memLimit)
 		    .trackLatest("ProgramStart");
-
-		// Test for TraceEvent length limits
-		/*std::string foo(4096, 'x');
-		TraceEvent("TooLongDetail").detail("Contents", foo);
-
-		TraceEvent("TooLongEvent")
-		    .detail("Contents1", foo)
-		    .detail("Contents2", foo)
-		    .detail("Contents3", foo)
-		    .detail("Contents4", foo)
-		    .detail("Contents5", foo)
-		    .detail("Contents6", foo)
-		    .detail("Contents7", foo)
-		    .detail("Contents8", foo)
-		    .detail("ExtraTest", 1776);*/
 
 		Error::init();
 		std::set_new_handler(&platform::outOfMemory);
@@ -1959,7 +1977,10 @@ int main(int argc, char* argv[]) {
 				                      opts.metricsConnFile,
 				                      opts.metricsPrefix,
 				                      opts.rsssize,
-				                      opts.whitelistBinPaths));
+				                      opts.whitelistBinPaths,
+				                      opts.configPath,
+				                      opts.manualKnobOverrides,
+				                      opts.useConfigDB));
 				actors.push_back(histogramReport());
 				// actors.push_back( recurring( []{}, .001 ) );  // for ASIO latency measurement
 
@@ -1993,6 +2014,18 @@ int main(int argc, char* argv[]) {
 			                       opts.testFile,
 			                       StringRef(),
 			                       opts.localities));
+			g_network->run();
+		} else if (role == ServerRole::UnitTests) {
+			setupRunLoopProfiler();
+			auto m = startSystemMonitor(opts.dataFolder, opts.dcId, opts.zoneId, opts.zoneId);
+			f = stopAfter(runTests(opts.connectionFile,
+			                       TEST_TYPE_UNIT_TESTS,
+			                       TEST_HERE,
+			                       1,
+			                       opts.testFile,
+			                       StringRef(),
+			                       opts.localities,
+			                       opts.testParams));
 			g_network->run();
 		} else if (role == ServerRole::CreateTemplateDatabase) {
 			createTemplateDatabase();
@@ -2110,7 +2143,7 @@ int main(int argc, char* argv[]) {
 					s = s.substr(LiteralStringRef("struct ").size());
 #endif
 
-				typeNames.push_back(std::make_pair(s, i->first));
+				typeNames.emplace_back(s, i->first);
 			}
 			std::sort(typeNames.begin(), typeNames.end());
 			for (int i = 0; i < typeNames.size(); i++) {

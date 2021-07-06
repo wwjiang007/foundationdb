@@ -25,10 +25,10 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include "flow/Arena.h"
 #include "flow/flow.h"
-#include "fdbclient/Knobs.h"
 
 typedef int64_t Version;
 typedef uint64_t LogEpoch;
@@ -242,6 +242,11 @@ std::string describeList(T const& items, int max_items) {
 
 template <class T>
 std::string describe(std::vector<T> const& items, int max_items = -1) {
+	return describeList(items, max_items);
+}
+
+template <class T>
+std::string describe(std::unordered_set<T> const& items, int max_items = -1) {
 	return describeList(items, max_items);
 }
 
@@ -468,11 +473,12 @@ struct Traceable<KeyValueRef> : std::true_type {
 	}
 };
 
-typedef Standalone<KeyRef> Key;
-typedef Standalone<ValueRef> Value;
-typedef Standalone<KeyRangeRef> KeyRange;
-typedef Standalone<KeyValueRef> KeyValue;
-typedef Standalone<struct KeySelectorRef> KeySelector;
+using Key = Standalone<KeyRef>;
+using Value = Standalone<ValueRef>;
+using KeyRange = Standalone<KeyRangeRef>;
+using KeyValue = Standalone<KeyValueRef>;
+using KeySelector = Standalone<struct KeySelectorRef>;
+using RangeResult = Standalone<struct RangeResultRef>;
 
 enum { invalidVersion = -1, latestVersion = -2, MAX_VERSION = std::numeric_limits<int64_t>::max() };
 
@@ -482,7 +488,9 @@ inline Key keyAfter(const KeyRef& key) {
 
 	Standalone<StringRef> r;
 	uint8_t* s = new (r.arena()) uint8_t[key.size() + 1];
-	memcpy(s, key.begin(), key.size());
+	if (key.size() > 0) {
+		memcpy(s, key.begin(), key.size());
+	}
 	s[key.size()] = 0;
 	((StringRef&)r) = StringRef(s, key.size() + 1);
 	return r;
@@ -511,28 +519,12 @@ inline KeyRange prefixRange(KeyRef prefix) {
 	range.contents() = KeyRangeRef(start, end);
 	return range;
 }
-inline KeyRef keyBetween(const KeyRangeRef& keys) {
-	// Returns (one of) the shortest key(s) either contained in keys or equal to keys.end,
-	// assuming its length is no more than CLIENT_KNOBS->SPLIT_KEY_SIZE_LIMIT. If the length of
-	// the shortest key exceeds that limit, then the end key is returned.
-	// The returned reference is valid as long as keys is valid.
 
-	int pos = 0; // will be the position of the first difference between keys.begin and keys.end
-	int minSize = std::min(keys.begin.size(), keys.end.size());
-	for (; pos < minSize && pos < CLIENT_KNOBS->SPLIT_KEY_SIZE_LIMIT; pos++) {
-		if (keys.begin[pos] != keys.end[pos]) {
-			return keys.end.substr(0, pos + 1);
-		}
-	}
-
-	// If one more character keeps us in the limit, and the latter key is simply
-	// longer, then we only need one more byte of the end string.
-	if (pos < CLIENT_KNOBS->SPLIT_KEY_SIZE_LIMIT && keys.begin.size() < keys.end.size()) {
-		return keys.end.substr(0, pos + 1);
-	}
-
-	return keys.end;
-}
+// Returns (one of) the shortest key(s) either contained in keys or equal to keys.end,
+// assuming its length is no more than CLIENT_KNOBS->SPLIT_KEY_SIZE_LIMIT. If the length of
+// the shortest key exceeds that limit, then the end key is returned.
+// The returned reference is valid as long as keys is valid.
+KeyRef keyBetween(const KeyRangeRef& keys);
 
 struct KeySelectorRef {
 private:
@@ -557,32 +549,9 @@ public:
 
 	KeyRef getKey() const { return key; }
 
-	void setKey(KeyRef const& key) {
-		// There are no keys in the database with size greater than KEY_SIZE_LIMIT, so if this key selector has a key
-		// which is large, then we can translate it to an equivalent key selector with a smaller key
-		if (key.size() > (key.startsWith(LiteralStringRef("\xff")) ? CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT
-		                                                           : CLIENT_KNOBS->KEY_SIZE_LIMIT))
-			this->key = key.substr(0,
-			                       (key.startsWith(LiteralStringRef("\xff")) ? CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT
-			                                                                 : CLIENT_KNOBS->KEY_SIZE_LIMIT) +
-			                           1);
-		else
-			this->key = key;
-	}
+	void setKey(KeyRef const& key);
 
-	std::string toString() const {
-		if (offset > 0) {
-			if (orEqual)
-				return format("%d+firstGreaterThan(%s)", offset - 1, printable(key).c_str());
-			else
-				return format("%d+firstGreaterOrEqual(%s)", offset - 1, printable(key).c_str());
-		} else {
-			if (orEqual)
-				return format("%d+lastLessOrEqual(%s)", offset, printable(key).c_str());
-			else
-				return format("%d+lastLessThan(%s)", offset, printable(key).c_str());
-		}
-	}
+	std::string toString() const;
 
 	bool isBackward() const {
 		return !orEqual && offset <= 0;
@@ -866,22 +835,36 @@ struct TLogSpillType {
 
 // Contains the amount of free and total space for a storage server, in bytes
 struct StorageBytes {
+	// Free space on the filesystem
 	int64_t free;
+	// Total space on the filesystem
 	int64_t total;
-	int64_t used; // Used by *this* store, not total-free
-	int64_t available; // Amount of disk space that can be used by data structure, including free disk space and
-	                   // internally reusable space
+	// Used by *this* store, not total - free
+	int64_t used;
+	// Amount of space available for use by the store, which includes free space on the filesystem
+	// and internal free space within the store data that is immediately reusable.
+	int64_t available;
+	// Amount of space that could eventually be available for use after garbage collection
+	int64_t temp;
 
 	StorageBytes() {}
-	StorageBytes(int64_t free, int64_t total, int64_t used, int64_t available)
-	  : free(free), total(total), used(used), available(available) {}
+	StorageBytes(int64_t free, int64_t total, int64_t used, int64_t available, int64_t temp = 0)
+	  : free(free), total(total), used(used), available(available), temp(temp) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
 		serializer(ar, free, total, used, available);
 	}
-};
 
+	std::string toString() const {
+		return format("{%.2f MB total, %.2f MB free, %.2f MB available, %.2f MB used, %.2f MB temp}",
+		              total / 1e6,
+		              free / 1e6,
+		              available / 1e6,
+		              used / 1e6,
+		              temp / 1e6);
+	}
+};
 struct LogMessageVersion {
 	// Each message pushed into the log system has a unique, totally ordered LogMessageVersion
 	// See ILogSystem::push() for how these are assigned

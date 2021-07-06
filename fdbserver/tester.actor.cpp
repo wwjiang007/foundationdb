@@ -39,6 +39,7 @@
 #include "fdbclient/MonitorLeader.h"
 #include "fdbserver/CoordinationInterface.h"
 #include "fdbclient/ManagementAPI.actor.h"
+#include "fdbserver/Knobs.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
 
@@ -361,6 +362,64 @@ TestWorkload* getWorkloadIface(WorkloadRequest work, Reference<AsyncVar<ServerDB
 		compound->add(workload);
 	}
 	return compound;
+}
+
+/**
+ * Only works in simulation. This method prints all simulated processes in a human readable form to stdout. It groups
+ * processes by data center, data hall, zone, and machine (in this order).
+ */
+void printSimulatedTopology() {
+	if (!g_network->isSimulated()) {
+		return;
+	}
+	auto processes = g_simulator.getAllProcesses();
+	std::sort(processes.begin(), processes.end(), [](ISimulator::ProcessInfo* lhs, ISimulator::ProcessInfo* rhs) {
+		auto l = lhs->locality;
+		auto r = rhs->locality;
+		if (l.dcId() != r.dcId()) {
+			return l.dcId() < r.dcId();
+		}
+		if (l.dataHallId() != r.dataHallId()) {
+			return l.dataHallId() < r.dataHallId();
+		}
+		if (l.zoneId() != r.zoneId()) {
+			return l.zoneId() < r.zoneId();
+		}
+		if (l.machineId() != r.zoneId()) {
+			return l.machineId() < r.machineId();
+		}
+		return lhs->address < rhs->address;
+	});
+	printf("Simulated Cluster Topology:\n");
+	printf("===========================\n");
+	Optional<Standalone<StringRef>> dcId, dataHallId, zoneId, machineId;
+	for (auto p : processes) {
+		std::string indent = "";
+		if (dcId != p->locality.dcId()) {
+			dcId = p->locality.dcId();
+			printf("%sdcId: %s\n", indent.c_str(), p->locality.describeDcId().c_str());
+		}
+		indent += "  ";
+		if (dataHallId != p->locality.dataHallId()) {
+			dataHallId = p->locality.dataHallId();
+			printf("%sdataHallId: %s\n", indent.c_str(), p->locality.describeDataHall().c_str());
+		}
+		indent += "  ";
+		if (zoneId != p->locality.zoneId()) {
+			zoneId = p->locality.zoneId();
+			printf("%szoneId: %s\n", indent.c_str(), p->locality.describeZone().c_str());
+		}
+		indent += "  ";
+		if (machineId != p->locality.machineId()) {
+			machineId = p->locality.machineId();
+			printf("%smachineId: %s\n", indent.c_str(), p->locality.describeMachineId().c_str());
+		}
+		indent += "  ";
+		printf("%sAddress: %s\n", indent.c_str(), p->address.toString().c_str(), p->name);
+		indent += "  ";
+		printf("%sClass: %s\n", indent.c_str(), p->startingClass.toString().c_str());
+		printf("%sName: %s\n", indent.c_str(), p->name);
+	}
 }
 
 ACTOR Future<Void> databaseWarmer(Database cx) {
@@ -705,7 +764,7 @@ ACTOR Future<DistributedTestResults> runWorkload(Database cx, std::vector<Tester
 		req.title = spec.title;
 		req.useDatabase = spec.useDB;
 		req.timeout = spec.timeout;
-		req.databasePingDelay = spec.databasePingDelay;
+		req.databasePingDelay = spec.useDB ? spec.databasePingDelay : 0.0;
 		req.options = spec.options;
 		req.clientId = i;
 		req.clientCount = testers.size();
@@ -811,6 +870,7 @@ ACTOR Future<Void> checkConsistency(Database cx,
                                     std::vector<TesterInterface> testers,
                                     bool doQuiescentCheck,
                                     bool doCacheCheck,
+                                    bool doTSSCheck,
                                     double quiescentWaitTimeout,
                                     double softTimeLimit,
                                     double databasePingDelay,
@@ -827,11 +887,16 @@ ACTOR Future<Void> checkConsistency(Database cx,
 	Standalone<VectorRef<KeyValueRef>> options;
 	StringRef performQuiescent = LiteralStringRef("false");
 	StringRef performCacheCheck = LiteralStringRef("false");
+	StringRef performTSSCheck = LiteralStringRef("false");
 	if (doQuiescentCheck) {
 		performQuiescent = LiteralStringRef("true");
+		spec.restorePerpetualWiggleSetting = false;
 	}
 	if (doCacheCheck) {
 		performCacheCheck = LiteralStringRef("true");
+	}
+	if (doTSSCheck) {
+		performTSSCheck = LiteralStringRef("true");
 	}
 	spec.title = LiteralStringRef("ConsistencyCheck");
 	spec.databasePingDelay = databasePingDelay;
@@ -840,6 +905,7 @@ ACTOR Future<Void> checkConsistency(Database cx,
 	                       KeyValueRef(LiteralStringRef("testName"), LiteralStringRef("ConsistencyCheck")));
 	options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("performQuiescentChecks"), performQuiescent));
 	options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("performCacheCheck"), performCacheCheck));
+	options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("performTSSCheck"), performTSSCheck));
 	options.push_back_deep(options.arena(),
 	                       KeyValueRef(LiteralStringRef("quiescentWaitTimeout"),
 	                                   ValueRef(options.arena(), format("%f", quiescentWaitTimeout))));
@@ -915,6 +981,7 @@ ACTOR Future<bool> runTest(Database cx,
 				                                   testers,
 				                                   quiescent,
 				                                   spec.runConsistencyCheckOnCache,
+				                                   spec.runConsistencyCheckOnTSS,
 				                                   10000.0,
 				                                   18000,
 				                                   spec.databasePingDelay,
@@ -977,7 +1044,13 @@ std::map<std::string, std::function<void(const std::string&)>> testSpecGlobalKey
 	      TraceEvent("TestParserTest").detail("ClientInfoLogging", value);
 	  } },
 	{ "startIncompatibleProcess",
-	  [](const std::string& value) { TraceEvent("TestParserTest").detail("ParsedStartIncompatibleProcess", value); } }
+	  [](const std::string& value) { TraceEvent("TestParserTest").detail("ParsedStartIncompatibleProcess", value); } },
+	{ "storageEngineExcludeTypes",
+	  [](const std::string& value) { TraceEvent("TestParserTest").detail("ParsedStorageEngineExcludeTypes", ""); } },
+	{ "maxTLogVersion",
+	  [](const std::string& value) { TraceEvent("TestParserTest").detail("ParsedMaxTLogVersion", ""); } },
+	{ "disableTss",
+	  [](const std::string& value) { TraceEvent("TestParserTest").detail("ParsedDisableTSS", ""); } }
 };
 
 std::map<std::string, std::function<void(const std::string& value, TestSpec* spec)>> testSpecTestKeys = {
@@ -1045,6 +1118,11 @@ std::map<std::string, std::function<void(const std::string& value, TestSpec* spe
 	  [](const std::string& value, TestSpec* spec) {
 	      spec->runConsistencyCheckOnCache = (value == "true");
 	      TraceEvent("TestParserTest").detail("ParsedRunConsistencyCheckOnCache", spec->runConsistencyCheckOnCache);
+	  } },
+	{ "runConsistencyCheckOnTSS",
+	  [](const std::string& value, TestSpec* spec) {
+	      spec->runConsistencyCheckOnTSS = (value == "true");
+	      TraceEvent("TestParserTest").detail("ParsedRunConsistencyCheckOnTSS", spec->runConsistencyCheckOnTSS);
 	  } },
 	{ "waitForQuiescence",
 	  [](const std::string& value, TestSpec* spec) {
@@ -1187,20 +1265,6 @@ std::vector<TestSpec> readTOMLTests_(std::string fileName) {
 
 	const toml::value& conf = toml::parse(fileName);
 
-	// Handle all global settings
-	for (const auto& [k, v] : conf.as_table()) {
-		if (k == "test") {
-			continue;
-		}
-		if (testSpecGlobalKeys.find(k) != testSpecGlobalKeys.end()) {
-			testSpecGlobalKeys[k](toml_to_string(v));
-		} else {
-			TraceEvent(SevError, "TestSpecUnrecognizedGlobalParam")
-			    .detail("Attrib", k)
-			    .detail("Value", toml_to_string(v));
-		}
-	}
-
 	// Then parse each test
 	const toml::array& tests = toml::find(conf, "test").as_array();
 	for (const toml::value& test : tests) {
@@ -1291,6 +1355,24 @@ ACTOR Future<Void> monitorServerDBInfo(Reference<AsyncVar<Optional<ClusterContro
 	}
 }
 
+/**
+ * \brief Test orchestrator: sends test specification to testers in the right order and collects the results.
+ *
+ * There are multiple actors in this file with similar names (runTest, runTests) and slightly different signatures.
+ *
+ * This is the actual orchestrator. It reads the test specifications (from tests), prepares the cluster (by running the
+ * configure command given in startingConfiguration) and then runs the workload.
+ *
+ * \param cc The cluster controller interface
+ * \param ci Same as cc.clientInterface
+ * \param testers The interfaces of the testers that should run the actual workloads
+ * \param tests The test specifications to run
+ * \param startingConfiguration If non-empty, the orchestrator will attempt to set this configuration before starting
+ * the tests.
+ * \param locality client locality (it seems this is unused?)
+ *
+ * \returns A future which will be set after all tests finished.
+ */
 ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterControllerFullInterface>>> cc,
                             Reference<AsyncVar<Optional<struct ClusterInterface>>> ci,
                             vector<TesterInterface> testers,
@@ -1304,6 +1386,8 @@ ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterController
 	state bool useDB = false;
 	state bool waitForQuiescenceBegin = false;
 	state bool waitForQuiescenceEnd = false;
+	state bool restorePerpetualWiggleSetting = false;
+	state bool perpetualWiggleEnabled = false;
 	state double startDelay = 0.0;
 	state double databasePingDelay = 1e9;
 	state ISimulator::BackupAgentType simBackupAgents = ISimulator::BackupAgentType::NoBackupAgents;
@@ -1318,6 +1402,8 @@ ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterController
 			waitForQuiescenceBegin = true;
 		if (iter->waitForQuiescenceEnd)
 			waitForQuiescenceEnd = true;
+		if (iter->restorePerpetualWiggleSetting)
+			restorePerpetualWiggleSetting = true;
 		startDelay = std::max(startDelay, iter->startDelay);
 		databasePingDelay = std::min(databasePingDelay, iter->databasePingDelay);
 		if (iter->simBackupAgents != ISimulator::BackupAgentType::NoBackupAgents)
@@ -1346,6 +1432,7 @@ ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterController
 
 	// Change the configuration (and/or create the database) if necessary
 	printf("startingConfiguration:%s start\n", startingConfiguration.toString().c_str());
+	printSimulatedTopology();
 	if (useDB && startingConfiguration != StringRef()) {
 		try {
 			wait(timeoutError(changeConfiguration(cx, testers, startingConfiguration), 2000.0));
@@ -1354,6 +1441,15 @@ ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterController
 			}
 		} catch (Error& e) {
 			TraceEvent(SevError, "TestFailure").error(e).detail("Reason", "Unable to set starting configuration");
+		}
+		if (restorePerpetualWiggleSetting) {
+			std::string_view confView(reinterpret_cast<const char*>(startingConfiguration.begin()),
+			                          startingConfiguration.size());
+			const std::string setting = "perpetual_storage_wiggle:=";
+			auto pos = confView.find(setting);
+			if (pos != confView.npos && confView.at(pos + setting.size()) == '1') {
+				perpetualWiggleEnabled = true;
+			}
 		}
 	}
 
@@ -1369,6 +1465,10 @@ ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterController
 		} catch (Error& e) {
 			TraceEvent("QuietDatabaseStartExternalError").error(e);
 			throw;
+		}
+
+		if (perpetualWiggleEnabled) { // restore the enabled perpetual storage wiggle setting
+			wait(setPerpetualStorageWiggle(cx, true, true));
 		}
 	}
 
@@ -1402,6 +1502,24 @@ ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterController
 	return Void();
 }
 
+/**
+ * \brief Proxy function that waits until enough testers are available and then calls into the orchestrator.
+ *
+ * There are multiple actors in this file with similar names (runTest, runTests) and slightly different signatures.
+ *
+ * This actor wraps the actual orchestrator (also called runTests). But before calling that actor, it waits for enough
+ * testers to come up.
+ *
+ * \param cc The cluster controller interface
+ * \param ci Same as cc.clientInterface
+ * \param tests The test specifications to run
+ * \param minTestersExpected The number of testers to expect. This actor will block until it can find this many testers.
+ * \param startingConfiguration If non-empty, the orchestrator will attempt to set this configuration before starting
+ * the tests.
+ * \param locality client locality (it seems this is unused?)
+ *
+ * \returns A future which will be set after all tests finished.
+ */
 ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterControllerFullInterface>>> cc,
                             Reference<AsyncVar<Optional<struct ClusterInterface>>> ci,
                             vector<TestSpec> tests,
@@ -1443,19 +1561,48 @@ ACTOR Future<Void> runTests(Reference<AsyncVar<Optional<struct ClusterController
 	return Void();
 }
 
+/**
+ * \brief Set up testing environment and run the given tests on a cluster.
+ *
+ * There are multiple actors in this file with similar names (runTest, runTests) and slightly different signatures.
+ *
+ * This actor is usually the first entry point into the test environment. It itself doesn't implement too much
+ * functionality. Its main purpose is to generate the test specification from passed arguments and then call into the
+ * correct actor which will orchestrate the actual test.
+ *
+ * \param connFile A cluster connection file. Not all tests require a functional cluster but all tests require
+ * a cluster file.
+ * \param whatToRun TEST_TYPE_FROM_FILE to read the test description from a passed toml file or
+ * TEST_TYPE_CONSISTENCY_CHECK to generate a test spec for consistency checking
+ * \param at TEST_HERE: this process will act as a test client and execute the given workload. TEST_ON_SERVERS: Run a
+ * test client on every worker in the cluster. TEST_ON_TESTERS: Run a test client on all servers with class Test
+ * \param minTestersExpected In at is not TEST_HERE, this will instruct the orchestrator until it can find at least
+ * minTestersExpected test-clients. This is usually passed through from a command line argument. In simulation, the
+ * simulator will pass the number of testers that it started.
+ * \param fileName The path to the toml-file containing the test description. Is ignored if whatToRun !=
+ * TEST_TYPE_FROM_FILE
+ * \param startingConfiguration Can be used to configure a cluster before running the test. If this is an empty string,
+ * it will be ignored, otherwise it will be passed to changeConfiguration.
+ * \param locality The client locality to be used. This is only used if at == TEST_HERE
+ *
+ * \returns A future which will be set after all tests finished.
+ */
 ACTOR Future<Void> runTests(Reference<ClusterConnectionFile> connFile,
                             test_type_t whatToRun,
                             test_location_t at,
                             int minTestersExpected,
                             std::string fileName,
                             StringRef startingConfiguration,
-                            LocalityData locality) {
+                            LocalityData locality,
+                            UnitTestParameters testOptions) {
 	state vector<TestSpec> testSpecs;
 	auto cc = makeReference<AsyncVar<Optional<ClusterControllerFullInterface>>>();
 	auto ci = makeReference<AsyncVar<Optional<ClusterInterface>>>();
 	vector<Future<Void>> actors;
-	actors.push_back(reportErrors(monitorLeader(connFile, cc), "MonitorLeader"));
-	actors.push_back(reportErrors(extractClusterInterface(cc, ci), "ExtractClusterInterface"));
+	if (connFile) {
+		actors.push_back(reportErrors(monitorLeader(connFile, cc), "MonitorLeader"));
+		actors.push_back(reportErrors(extractClusterInterface(cc, ci), "ExtractClusterInterface"));
+	}
 
 	if (whatToRun == TEST_TYPE_CONSISTENCY_CHECK) {
 		TestSpec spec;
@@ -1478,6 +1625,22 @@ ACTOR Future<Void> runTests(Reference<ClusterConnectionFile> connFile,
 		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("rateLimitMax"), StringRef(rateLimitMax)));
 		options.push_back_deep(options.arena(),
 		                       KeyValueRef(LiteralStringRef("shuffleShards"), LiteralStringRef("true")));
+		spec.options.push_back_deep(spec.options.arena(), options);
+		testSpecs.push_back(spec);
+	} else if (whatToRun == TEST_TYPE_UNIT_TESTS) {
+		TestSpec spec;
+		Standalone<VectorRef<KeyValueRef>> options;
+		spec.title = LiteralStringRef("UnitTests");
+		spec.startDelay = 0;
+		spec.useDB = false;
+		spec.timeout = 0;
+		options.push_back_deep(options.arena(),
+		                       KeyValueRef(LiteralStringRef("testName"), LiteralStringRef("UnitTests")));
+		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("testsMatching"), fileName));
+		// Add unit test options as test spec options
+		for (auto& kv : testOptions.params) {
+			options.push_back_deep(options.arena(), KeyValueRef(kv.first, kv.second));
+		}
 		spec.options.push_back_deep(spec.options.arena(), options);
 		testSpecs.push_back(spec);
 	} else {

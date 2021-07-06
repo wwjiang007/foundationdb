@@ -18,6 +18,7 @@
  * limitations under the License.
  */
 
+#include "fdbbackup/BackupTLSConfig.h"
 #include "fdbclient/JsonBuilder.h"
 #include "flow/Arena.h"
 #include "flow/Error.h"
@@ -37,6 +38,7 @@
 #include "fdbclient/Status.h"
 #include "fdbclient/BackupContainer.h"
 #include "fdbclient/KeyBackedTypes.h"
+#include "fdbclient/IKnobCollection.h"
 #include "fdbclient/RunTransaction.actor.h"
 #include "fdbclient/S3BlobStore.h"
 #include "fdbclient/json_spirit/json_spirit_writer_template.h"
@@ -105,6 +107,7 @@ enum {
 	// Backup constants
 	OPT_DESTCONTAINER,
 	OPT_SNAPSHOTINTERVAL,
+	OPT_INITIAL_SNAPSHOT_INTERVAL,
 	OPT_ERRORLIMIT,
 	OPT_NOSTOPWHENDONE,
 	OPT_EXPIRE_BEFORE_VERSION,
@@ -144,6 +147,7 @@ enum {
 	OPT_RESTORE_CLUSTERFILE_DEST,
 	OPT_RESTORE_CLUSTERFILE_ORIG,
 	OPT_RESTORE_BEGIN_VERSION,
+	OPT_RESTORE_INCONSISTENT_SNAPSHOT_ONLY,
 
 	// Shared constants
 	OPT_CLUSTERFILE,
@@ -232,6 +236,7 @@ CSimpleOpt::SOption g_rgBackupStartOptions[] = {
 	{ OPT_USE_PARTITIONED_LOG, "--partitioned_log_experimental", SO_NONE },
 	{ OPT_SNAPSHOTINTERVAL, "-s", SO_REQ_SEP },
 	{ OPT_SNAPSHOTINTERVAL, "--snapshot_interval", SO_REQ_SEP },
+	{ OPT_INITIAL_SNAPSHOT_INTERVAL, "--initial_snapshot_interval", SO_REQ_SEP },
 	{ OPT_TAGNAME, "-t", SO_REQ_SEP },
 	{ OPT_TAGNAME, "--tagname", SO_REQ_SEP },
 	{ OPT_BACKUPKEYS, "-k", SO_REQ_SEP },
@@ -691,6 +696,7 @@ CSimpleOpt::SOption g_rgRestoreOptions[] = {
 	{ OPT_BLOB_CREDENTIALS, "--blob_credentials", SO_REQ_SEP },
 	{ OPT_INCREMENTALONLY, "--incremental", SO_NONE },
 	{ OPT_RESTORE_BEGIN_VERSION, "--begin_version", SO_REQ_SEP },
+	{ OPT_RESTORE_INCONSISTENT_SNAPSHOT_ONLY, "--inconsistent_snapshot_only", SO_NONE },
 #ifndef TLS_DISABLED
 	TLS_OPTION_FLAGS
 #endif
@@ -1571,7 +1577,7 @@ ACTOR Future<std::string> getLayerStatus(Reference<ReadYourWritesTransaction> tr
 		state Reference<ReadYourWritesTransaction> tr2(new ReadYourWritesTransaction(dest));
 		tr2->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 		tr2->setOption(FDBTransactionOptions::LOCK_AWARE);
-		state Standalone<RangeResultRef> tagNames = wait(tr2->getRange(dba.tagNames.range(), 10000, snapshot));
+		state RangeResult tagNames = wait(tr2->getRange(dba.tagNames.range(), 10000, snapshot));
 		state std::vector<Future<Optional<Key>>> backupVersion;
 		state std::vector<Future<EBackupState>> backupStatus;
 		state std::vector<Future<int64_t>> tagRangeBytesDR;
@@ -1633,7 +1639,7 @@ ACTOR Future<Void> cleanupStatus(Reference<ReadYourWritesTransaction> tr,
                                  std::string name,
                                  std::string id,
                                  int limit = 1) {
-	state Standalone<RangeResultRef> docs = wait(tr->getRange(KeyRangeRef(rootKey, strinc(rootKey)), limit, true));
+	state RangeResult docs = wait(tr->getRange(KeyRangeRef(rootKey, strinc(rootKey)), limit, true));
 	state bool readMore = false;
 	state int i;
 	for (i = 0; i < docs.size(); ++i) {
@@ -1662,7 +1668,7 @@ ACTOR Future<Void> cleanupStatus(Reference<ReadYourWritesTransaction> tr,
 		}
 		if (readMore) {
 			limit = 10000;
-			Standalone<RangeResultRef> docs2 = wait(tr->getRange(KeyRangeRef(rootKey, strinc(rootKey)), limit, true));
+			RangeResult docs2 = wait(tr->getRange(KeyRangeRef(rootKey, strinc(rootKey)), limit, true));
 			docs = std::move(docs2);
 			readMore = false;
 		}
@@ -1679,7 +1685,7 @@ ACTOR Future<json_spirit::mObject> getLayerStatus(Database src, std::string root
 		try {
 			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			state Standalone<RangeResultRef> kvPairs =
+			state RangeResult kvPairs =
 			    wait(tr.getRange(KeyRangeRef(rootKey, strinc(rootKey)), GetRangeLimits::ROW_LIMIT_UNLIMITED));
 			json_spirit::mObject statusDoc;
 			JSONDoc modifier(statusDoc);
@@ -1879,6 +1885,7 @@ ACTOR Future<Void> submitDBBackup(Database src,
 
 ACTOR Future<Void> submitBackup(Database db,
                                 std::string url,
+                                int initialSnapshotIntervalSeconds,
                                 int snapshotIntervalSeconds,
                                 Standalone<VectorRef<KeyRangeRef>> backupRanges,
                                 std::string tagName,
@@ -1935,6 +1942,7 @@ ACTOR Future<Void> submitBackup(Database db,
 		else {
 			wait(backupAgent.submitBackup(db,
 			                              KeyRef(url),
+			                              initialSnapshotIntervalSeconds,
 			                              snapshotIntervalSeconds,
 			                              tagName,
 			                              backupRanges,
@@ -2236,6 +2244,8 @@ Reference<IBackupContainer> openBackupContainer(const char* name, std::string de
 	return c;
 }
 
+// Submit the restore request to the database if "performRestore" is true. Otherwise,
+// check if the restore can be performed.
 ACTOR Future<Void> runRestore(Database db,
                               std::string originalClusterFile,
                               std::string tagName,
@@ -2249,7 +2259,8 @@ ACTOR Future<Void> runRestore(Database db,
                               bool waitForDone,
                               std::string addPrefix,
                               std::string removePrefix,
-                              bool incrementalBackupOnly) {
+                              bool onlyAppyMutationLogs,
+                              bool inconsistentSnapshotOnly) {
 	if (ranges.empty()) {
 		ranges.push_back_deep(ranges.arena(), normalKeys);
 	}
@@ -2295,7 +2306,7 @@ ACTOR Future<Void> runRestore(Database db,
 
 			BackupDescription desc = wait(bc->describeBackup());
 
-			if (incrementalBackupOnly && desc.contiguousLogEnd.present()) {
+			if (onlyAppyMutationLogs && desc.contiguousLogEnd.present()) {
 				targetVersion = desc.contiguousLogEnd.get() - 1;
 			} else if (desc.maxRestorableVersion.present()) {
 				targetVersion = desc.maxRestorableVersion.get();
@@ -2320,7 +2331,8 @@ ACTOR Future<Void> runRestore(Database db,
 			                                                   KeyRef(addPrefix),
 			                                                   KeyRef(removePrefix),
 			                                                   true,
-			                                                   incrementalBackupOnly,
+			                                                   onlyAppyMutationLogs,
+			                                                   inconsistentSnapshotOnly,
 			                                                   beginVersion));
 
 			if (waitForDone && verbose) {
@@ -2328,7 +2340,7 @@ ACTOR Future<Void> runRestore(Database db,
 				printf("Restored to version %" PRId64 "\n", restoredVersion);
 			}
 		} else {
-			state Optional<RestorableFileSet> rset = wait(bc->getRestoreSet(targetVersion));
+			state Optional<RestorableFileSet> rset = wait(bc->getRestoreSet(targetVersion, ranges));
 
 			if (!rset.present()) {
 				fprintf(stderr,
@@ -3210,6 +3222,8 @@ int main(int argc, char* argv[]) {
 		std::string destinationContainer;
 		bool describeDeep = false;
 		bool describeTimestamps = false;
+		int initialSnapshotIntervalSeconds =
+		    0; // The initial snapshot has a desired duration of 0, meaning go as fast as possible.
 		int snapshotIntervalSeconds = CLIENT_KNOBS->BACKUP_DEFAULT_SNAPSHOT_INTERVAL_SEC;
 		std::string clusterFile;
 		std::string sourceClusterFile;
@@ -3234,6 +3248,8 @@ int main(int argc, char* argv[]) {
 		bool stopWhenDone = true;
 		bool usePartitionedLog = false; // Set to true to use new backup system
 		bool incrementalBackupOnly = false;
+		bool onlyAppyMutationLogs = false;
+		bool inconsistentSnapshotOnly = false;
 		bool forceAction = false;
 		bool trace = false;
 		bool quietDisplay = false;
@@ -3249,8 +3265,7 @@ int main(int argc, char* argv[]) {
 		LocalityData localities;
 		uint64_t memLimit = 8LL << 30;
 		Optional<uint64_t> ti;
-		std::vector<std::string> blobCredentials;
-		std::string tlsCertPath, tlsKeyPath, tlsCAPath, tlsPassword, tlsVerifyPeers;
+		BackupTLSConfig tlsConfig;
 		Version dumpBegin = 0;
 		Version dumpEnd = std::numeric_limits<Version>::max();
 		std::string restoreClusterFileDest;
@@ -3343,7 +3358,7 @@ int main(int argc, char* argv[]) {
 				deleteData = true;
 				break;
 			case OPT_MIN_CLEANUP_SECONDS:
-				knobs.push_back(std::make_pair("min_cleanup_seconds", args->OptionArg()));
+				knobs.emplace_back("min_cleanup_seconds", args->OptionArg());
 				break;
 			case OPT_FORCE:
 				forceAction = true;
@@ -3438,7 +3453,7 @@ int main(int argc, char* argv[]) {
 					return FDB_EXIT_ERROR;
 				}
 				syn = syn.substr(7);
-				knobs.push_back(std::make_pair(syn, args->OptionArg()));
+				knobs.emplace_back(syn, args->OptionArg());
 				break;
 			}
 			case OPT_BACKUPKEYS:
@@ -3465,6 +3480,7 @@ int main(int argc, char* argv[]) {
 				modifyOptions.destURL = destinationContainer;
 				break;
 			case OPT_SNAPSHOTINTERVAL:
+			case OPT_INITIAL_SNAPSHOT_INTERVAL:
 			case OPT_MOD_ACTIVE_INTERVAL: {
 				const char* a = args->OptionArg();
 				int seconds;
@@ -3476,6 +3492,8 @@ int main(int argc, char* argv[]) {
 				if (optId == OPT_SNAPSHOTINTERVAL) {
 					snapshotIntervalSeconds = seconds;
 					modifyOptions.snapshotIntervalSeconds = seconds;
+				} else if (optId == OPT_INITIAL_SNAPSHOT_INTERVAL) {
+					initialSnapshotIntervalSeconds = seconds;
 				} else if (optId == OPT_MOD_ACTIVE_INTERVAL) {
 					modifyOptions.activeSnapshotIntervalSeconds = seconds;
 				}
@@ -3495,6 +3513,7 @@ int main(int argc, char* argv[]) {
 				break;
 			case OPT_INCREMENTALONLY:
 				incrementalBackupOnly = true;
+				onlyAppyMutationLogs = true;
 				break;
 			case OPT_RESTORECONTAINER:
 				restoreContainer = args->OptionArg();
@@ -3545,6 +3564,10 @@ int main(int argc, char* argv[]) {
 				restoreVersion = ver;
 				break;
 			}
+			case OPT_RESTORE_INCONSISTENT_SNAPSHOT_ONLY: {
+				inconsistentSnapshotOnly = true;
+				break;
+			}
 #ifdef _WIN32
 			case OPT_PARENTPID: {
 				auto pid_str = args->OptionArg();
@@ -3576,26 +3599,26 @@ int main(int argc, char* argv[]) {
 				memLimit = ti.get();
 				break;
 			case OPT_BLOB_CREDENTIALS:
-				blobCredentials.push_back(args->OptionArg());
+				tlsConfig.blobCredentials.push_back(args->OptionArg());
 				break;
 #ifndef TLS_DISABLED
 			case TLSConfig::OPT_TLS_PLUGIN:
 				args->OptionArg();
 				break;
 			case TLSConfig::OPT_TLS_CERTIFICATES:
-				tlsCertPath = args->OptionArg();
+				tlsConfig.tlsCertPath = args->OptionArg();
 				break;
 			case TLSConfig::OPT_TLS_PASSWORD:
-				tlsPassword = args->OptionArg();
+				tlsConfig.tlsPassword = args->OptionArg();
 				break;
 			case TLSConfig::OPT_TLS_CA_FILE:
-				tlsCAPath = args->OptionArg();
+				tlsConfig.tlsCAPath = args->OptionArg();
 				break;
 			case TLSConfig::OPT_TLS_KEY:
-				tlsKeyPath = args->OptionArg();
+				tlsConfig.tlsKeyPath = args->OptionArg();
 				break;
 			case TLSConfig::OPT_TLS_VERIFY_PEERS:
-				tlsVerifyPeers = args->OptionArg();
+				tlsConfig.tlsVerifyPeers = args->OptionArg();
 				break;
 #endif
 			case OPT_DUMP_BEGIN:
@@ -3681,27 +3704,26 @@ int main(int argc, char* argv[]) {
 			}
 		}
 
-		for (auto k = knobs.begin(); k != knobs.end(); ++k) {
+		IKnobCollection::setGlobalKnobCollection(IKnobCollection::Type::CLIENT, Randomize::NO, IsSimulated::NO);
+		auto& g_knobs = IKnobCollection::getMutableGlobalKnobCollection();
+		for (const auto& [knobName, knobValueString] : knobs) {
 			try {
-				if (!globalFlowKnobs->setKnob(k->first, k->second) &&
-				    !globalClientKnobs->setKnob(k->first, k->second)) {
-					fprintf(stderr, "WARNING: Unrecognized knob option '%s'\n", k->first.c_str());
-					TraceEvent(SevWarnAlways, "UnrecognizedKnobOption").detail("Knob", printable(k->first));
-				}
+				auto knobValue = g_knobs.parseKnobValue(knobName, knobValueString);
+				g_knobs.setKnob(knobName, knobValue);
 			} catch (Error& e) {
 				if (e.code() == error_code_invalid_option_value) {
 					fprintf(stderr,
 					        "WARNING: Invalid value '%s' for knob option '%s'\n",
-					        k->second.c_str(),
-					        k->first.c_str());
+					        knobValueString.c_str(),
+					        knobName.c_str());
 					TraceEvent(SevWarnAlways, "InvalidKnobValue")
-					    .detail("Knob", printable(k->first))
-					    .detail("Value", printable(k->second));
+					    .detail("Knob", printable(knobName))
+					    .detail("Value", printable(knobValueString));
 				} else {
-					fprintf(stderr, "ERROR: Failed to set knob option '%s': %s\n", k->first.c_str(), e.what());
+					fprintf(stderr, "ERROR: Failed to set knob option '%s': %s\n", knobName.c_str(), e.what());
 					TraceEvent(SevError, "FailedToSetKnob")
-					    .detail("Knob", printable(k->first))
-					    .detail("Value", printable(k->second))
+					    .detail("Knob", printable(knobName))
+					    .detail("Value", printable(knobValueString))
 					    .error(e);
 					throw;
 				}
@@ -3709,8 +3731,7 @@ int main(int argc, char* argv[]) {
 		}
 
 		// Reinitialize knobs in order to update knobs that are dependent on explicitly set knobs
-		globalFlowKnobs->initialize(true);
-		globalClientKnobs->initialize(true);
+		g_knobs.initialize(Randomize::NO, IsSimulated::NO);
 
 		if (trace) {
 			if (!traceLogGroup.empty())
@@ -3729,42 +3750,8 @@ int main(int argc, char* argv[]) {
 		setNetworkOption(FDBNetworkOptions::DISABLE_CLIENT_STATISTICS_LOGGING);
 
 		// deferred TLS options
-		if (tlsCertPath.size()) {
-			try {
-				setNetworkOption(FDBNetworkOptions::TLS_CERT_PATH, tlsCertPath);
-			} catch (Error& e) {
-				fprintf(stderr, "ERROR: cannot set TLS certificate path to `%s' (%s)\n", tlsCertPath.c_str(), e.what());
-				return 1;
-			}
-		}
-
-		if (tlsCAPath.size()) {
-			try {
-				setNetworkOption(FDBNetworkOptions::TLS_CA_PATH, tlsCAPath);
-			} catch (Error& e) {
-				fprintf(stderr, "ERROR: cannot set TLS CA path to `%s' (%s)\n", tlsCAPath.c_str(), e.what());
-				return 1;
-			}
-		}
-		if (tlsKeyPath.size()) {
-			try {
-				if (tlsPassword.size())
-					setNetworkOption(FDBNetworkOptions::TLS_PASSWORD, tlsPassword);
-
-				setNetworkOption(FDBNetworkOptions::TLS_KEY_PATH, tlsKeyPath);
-			} catch (Error& e) {
-				fprintf(stderr, "ERROR: cannot set TLS key path to `%s' (%s)\n", tlsKeyPath.c_str(), e.what());
-				return 1;
-			}
-		}
-		if (tlsVerifyPeers.size()) {
-			try {
-				setNetworkOption(FDBNetworkOptions::TLS_VERIFY_PEERS, tlsVerifyPeers);
-			} catch (Error& e) {
-				fprintf(
-				    stderr, "ERROR: cannot set TLS peer verification to `%s' (%s)\n", tlsVerifyPeers.c_str(), e.what());
-				return 1;
-			}
+		if (!tlsConfig.setupTLS()) {
+			return 1;
 		}
 
 		Error::init();
@@ -3804,25 +3791,8 @@ int main(int argc, char* argv[]) {
 		// are logged. This thread will eventually run the network, so call it now.
 		TraceEvent::setNetworkThread();
 
-		// Add blob credentials files from the environment to the list collected from the command line.
-		const char* blobCredsFromENV = getenv("FDB_BLOB_CREDENTIALS");
-		if (blobCredsFromENV != nullptr) {
-			StringRef t((uint8_t*)blobCredsFromENV, strlen(blobCredsFromENV));
-			do {
-				StringRef file = t.eat(":");
-				if (file.size() != 0)
-					blobCredentials.push_back(file.toString());
-			} while (t.size() != 0);
-		}
-
-		// Update the global blob credential files list
-		std::vector<std::string>* pFiles =
-		    (std::vector<std::string>*)g_network->global(INetwork::enBlobCredentialFiles);
-		if (pFiles != nullptr) {
-			for (auto& f : blobCredentials) {
-				pFiles->push_back(f);
-			}
-		}
+		// Sets up blob credentials, including one from the environment FDB_BLOB_CREDENTIALS.
+		tlsConfig.setupBlobCredentials();
 
 		// Opens a trace file if trace is set (and if a trace file isn't already open)
 		// For most modes, initCluster() will open a trace file, but some fdbbackup operations do not require
@@ -3886,6 +3856,7 @@ int main(int argc, char* argv[]) {
 				openBackupContainer(argv[0], destinationContainer);
 				f = stopAfter(submitBackup(db,
 				                           destinationContainer,
+				                           initialSnapshotIntervalSeconds,
 				                           snapshotIntervalSeconds,
 				                           backupKeys,
 				                           tagName,
@@ -4062,7 +4033,8 @@ int main(int argc, char* argv[]) {
 				                         waitForDone,
 				                         addPrefix,
 				                         removePrefix,
-				                         incrementalBackupOnly));
+				                         onlyAppyMutationLogs,
+				                         inconsistentSnapshotOnly));
 				break;
 			case RestoreType::WAIT:
 				f = stopAfter(success(ba.waitRestore(db, KeyRef(tagName), true)));
@@ -4239,7 +4211,7 @@ int main(int argc, char* argv[]) {
 					s = s.substr(LiteralStringRef("struct ").size());
 #endif
 
-				typeNames.push_back(std::make_pair(s, i->first));
+				typeNames.emplace_back(s, i->first);
 			}
 			std::sort(typeNames.begin(), typeNames.end());
 			for (int i = 0; i < typeNames.size(); i++) {

@@ -26,6 +26,8 @@ const StringRef LocalityData::keyZoneId = LiteralStringRef("zoneid");
 const StringRef LocalityData::keyDcId = LiteralStringRef("dcid");
 const StringRef LocalityData::keyMachineId = LiteralStringRef("machineid");
 const StringRef LocalityData::keyDataHallId = LiteralStringRef("data_hall");
+const StringRef LocalityData::ExcludeLocalityKeyMachineIdPrefix = LiteralStringRef("locality_machineid:");
+const StringRef LocalityData::ExcludeLocalityPrefix = LiteralStringRef("locality_");
 
 ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const {
 	switch (role) {
@@ -63,7 +65,7 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 		default:
 			return ProcessClass::NeverAssign;
 		}
-	case ProcessClass::CommitProxy:
+	case ProcessClass::CommitProxy: // Resolver, Master, CommitProxy, and GrvProxy need to be the same besides best fit
 		switch (_class) {
 		case ProcessClass::CommitProxyClass:
 			return ProcessClass::BestFit;
@@ -71,10 +73,6 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 			return ProcessClass::GoodFit;
 		case ProcessClass::UnsetClass:
 			return ProcessClass::UnsetFit;
-		case ProcessClass::GrvProxyClass:
-			return ProcessClass::OkayFit;
-		case ProcessClass::ResolutionClass:
-			return ProcessClass::OkayFit;
 		case ProcessClass::TransactionClass:
 			return ProcessClass::OkayFit;
 		case ProcessClass::CoordinatorClass:
@@ -84,7 +82,7 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 		default:
 			return ProcessClass::WorstFit;
 		}
-	case ProcessClass::GrvProxy:
+	case ProcessClass::GrvProxy: // Resolver, Master, CommitProxy, and GrvProxy need to be the same besides best fit
 		switch (_class) {
 		case ProcessClass::GrvProxyClass:
 			return ProcessClass::BestFit;
@@ -92,10 +90,6 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 			return ProcessClass::GoodFit;
 		case ProcessClass::UnsetClass:
 			return ProcessClass::UnsetFit;
-		case ProcessClass::CommitProxyClass:
-			return ProcessClass::OkayFit;
-		case ProcessClass::ResolutionClass:
-			return ProcessClass::OkayFit;
 		case ProcessClass::TransactionClass:
 			return ProcessClass::OkayFit;
 		case ProcessClass::CoordinatorClass:
@@ -105,7 +99,7 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 		default:
 			return ProcessClass::WorstFit;
 		}
-	case ProcessClass::Master:
+	case ProcessClass::Master: // Resolver, Master, CommitProxy, and GrvProxy need to be the same besides best fit
 		switch (_class) {
 		case ProcessClass::MasterClass:
 			return ProcessClass::BestFit;
@@ -113,7 +107,7 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 			return ProcessClass::GoodFit;
 		case ProcessClass::UnsetClass:
 			return ProcessClass::UnsetFit;
-		case ProcessClass::ResolutionClass:
+		case ProcessClass::TransactionClass:
 			return ProcessClass::OkayFit;
 		case ProcessClass::CoordinatorClass:
 		case ProcessClass::TesterClass:
@@ -122,7 +116,7 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 		default:
 			return ProcessClass::WorstFit;
 		}
-	case ProcessClass::Resolver:
+	case ProcessClass::Resolver: // Resolver, Master, CommitProxy, and GrvProxy need to be the same besides best fit
 		switch (_class) {
 		case ProcessClass::ResolutionClass:
 			return ProcessClass::BestFit;
@@ -147,8 +141,6 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 			return ProcessClass::GoodFit;
 		case ProcessClass::UnsetClass:
 			return ProcessClass::UnsetFit;
-		case ProcessClass::ResolutionClass:
-			return ProcessClass::OkayFit;
 		case ProcessClass::TransactionClass:
 			return ProcessClass::OkayFit;
 		case ProcessClass::CoordinatorClass:
@@ -167,8 +159,6 @@ ProcessClass::Fitness ProcessClass::machineClassFitness(ClusterRole role) const 
 			return ProcessClass::GoodFit;
 		case ProcessClass::UnsetClass:
 			return ProcessClass::UnsetFit;
-		case ProcessClass::ResolutionClass:
-			return ProcessClass::OkayFit;
 		case ProcessClass::TransactionClass:
 			return ProcessClass::OkayFit;
 		case ProcessClass::CoordinatorClass:

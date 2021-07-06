@@ -51,6 +51,8 @@ constexpr UID WLTOKEN_PING_PACKET(-1, 1);
 constexpr int PACKET_LEN_WIDTH = sizeof(uint32_t);
 const uint64_t TOKEN_STREAM_FLAG = 1;
 
+static constexpr int WLTOKEN_COUNTS = 20; // number of wellKnownEndpoints
+
 class EndpointMap : NonCopyable {
 public:
 	// Reserve space for this many wellKnownEndpoints
@@ -96,6 +98,7 @@ void EndpointMap::realloc() {
 
 void EndpointMap::insertWellKnown(NetworkMessageReceiver* r, const Endpoint::Token& token, TaskPriority priority) {
 	int index = token.second();
+	ASSERT(index <= WLTOKEN_COUNTS);
 	ASSERT(data[index].receiver == nullptr);
 	data[index].receiver = r;
 	data[index].token() =
@@ -155,7 +158,7 @@ const Endpoint& EndpointMap::insert(NetworkAddressList localAddresses,
 NetworkMessageReceiver* EndpointMap::get(Endpoint::Token const& token) {
 	uint32_t index = token.second();
 	if (index < wellKnownEndpointCount && data[index].receiver == nullptr) {
-		TraceEvent(SevWarnAlways, "WellKnownEndpointNotAdded").detail("Token", token);
+		TraceEvent(SevWarnAlways, "WellKnownEndpointNotAdded").detail("Token", token).detail("Index", index).backtrace();
 	}
 	if (index < data.size() && data[index].token().first() == token.first() &&
 	    ((data[index].token().second() & 0xffffffff00000000LL) | index) == token.second())
@@ -196,8 +199,9 @@ struct EndpointNotFoundReceiver final : NetworkMessageReceiver {
 
 	void receive(ArenaObjectReader& reader) override {
 		// Remote machine tells us it doesn't have endpoint e
-		Endpoint e;
-		reader.deserialize(e);
+		UID token;
+		reader.deserialize(token);
+		Endpoint e = FlowTransport::transport().loadedEndpoint(token);
 		IFailureMonitor::failureMonitor().endpointNotFound(e);
 	}
 };
@@ -307,6 +311,7 @@ ACTOR Future<Void> pingLatencyLogger(TransportData* self) {
 				    .detail("Count", peer->pingLatencies.getPopulationSize())
 				    .detail("BytesReceived", peer->bytesReceived - peer->lastLoggedBytesReceived)
 				    .detail("BytesSent", peer->bytesSent - peer->lastLoggedBytesSent)
+				    .detail("TimeoutCount", peer->timeoutCount)
 				    .detail("ConnectOutgoingCount", peer->connectOutgoingCount)
 				    .detail("ConnectIncomingCount", peer->connectIncomingCount)
 				    .detail("ConnectFailedCount", peer->connectFailedCount)
@@ -323,6 +328,7 @@ ACTOR Future<Void> pingLatencyLogger(TransportData* self) {
 				peer->connectLatencies.clear();
 				peer->lastLoggedBytesReceived = peer->bytesReceived;
 				peer->lastLoggedBytesSent = peer->bytesSent;
+				peer->timeoutCount = 0;
 				wait(delay(FLOW_KNOBS->PING_LOGGING_INTERVAL));
 			} else if (it == self->orderedAddresses.begin()) {
 				wait(delay(FLOW_KNOBS->PING_LOGGING_INTERVAL));
@@ -334,7 +340,7 @@ ACTOR Future<Void> pingLatencyLogger(TransportData* self) {
 }
 
 TransportData::TransportData(uint64_t transportId)
-  : endpoints(/*wellKnownTokenCount*/ 11), endpointNotFoundReceiver(endpoints), pingReceiver(endpoints),
+  : endpoints(WLTOKEN_COUNTS), endpointNotFoundReceiver(endpoints), pingReceiver(endpoints),
     warnAlwaysForLargePacket(true), lastIncompatibleMessage(0), transportId(transportId),
     numIncompatibleConnections(0) {
 	degraded = makeReference<AsyncVar<bool>>(false);
@@ -474,6 +480,7 @@ ACTOR Future<Void> connectionMonitor(Reference<Peer> peer) {
 		loop {
 			choose {
 				when(wait(delay(FLOW_KNOBS->CONNECTION_MONITOR_TIMEOUT))) {
+					peer->timeoutCount++;
 					if (startingBytes == peer->bytesReceived) {
 						if (peer->destination.isPublic()) {
 							peer->pingLatencies.addSample(now() - startTime);
@@ -618,7 +625,6 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 				            IFailureMonitor::failureMonitor().getState(self->destination).isAvailable() ? "OK"
 				                                                                                        : "FAILED");
 				++self->connectOutgoingCount;
-
 				try {
 					choose {
 						when(Reference<IConnection> _conn =
@@ -760,6 +766,13 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 
 				conn->close();
 				conn = Reference<IConnection>();
+
+				// Old versions will throw this error, and we don't want to forget their protocol versions.
+				// This means we can't tell the difference between an old protocol version and one we
+				// can no longer connect to.
+				if (e.code() != error_code_incompatible_protocol_version) {
+					self->protocolVersion->set(Optional<ProtocolVersion>());
+				}
 			}
 
 			// Clients might send more packets in response, which needs to go out on the next connection
@@ -786,8 +799,9 @@ Peer::Peer(TransportData* transport, NetworkAddress const& destination)
     reconnectionDelay(FLOW_KNOBS->INITIAL_RECONNECTION_TIME), compatible(true), outstandingReplies(0),
     incompatibleProtocolVersionNewer(false), peerReferences(-1), bytesReceived(0), lastDataPacketSentTime(now()),
     pingLatencies(destination.isPublic() ? FLOW_KNOBS->PING_SAMPLE_AMOUNT : 1), lastLoggedBytesReceived(0),
-    bytesSent(0), lastLoggedBytesSent(0), lastLoggedTime(0.0), connectOutgoingCount(0), connectIncomingCount(0),
-    connectFailedCount(0), connectLatencies(destination.isPublic() ? FLOW_KNOBS->NETWORK_CONNECT_SAMPLE_AMOUNT : 1) {
+    bytesSent(0), lastLoggedBytesSent(0), timeoutCount(0), lastLoggedTime(0.0), connectOutgoingCount(0), connectIncomingCount(0),
+    connectFailedCount(0), connectLatencies(destination.isPublic() ? FLOW_KNOBS->NETWORK_CONNECT_SAMPLE_AMOUNT : 1),
+    protocolVersion(Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>())) {
 	IFailureMonitor::failureMonitor().setStatus(destination, FailureStatus(false));
 }
 
@@ -943,13 +957,13 @@ ACTOR static void deliver(TransportData* self,
 		if (destination.token.first() != -1) {
 			if (self->isLocalAddress(destination.getPrimaryAddress())) {
 				sendLocal(self,
-				          SerializeSource<Endpoint>(Endpoint(self->localAddresses, destination.token)),
+				          SerializeSource<UID>(destination.token),
 				          Endpoint(destination.addresses, WLTOKEN_ENDPOINT_NOT_FOUND));
 			} else {
 				Reference<Peer> peer = self->getOrOpenPeer(destination.getPrimaryAddress());
 				sendPacket(self,
 				           peer,
-				           SerializeSource<Endpoint>(Endpoint(self->localAddresses, destination.token)),
+				           SerializeSource<UID>(destination.token),
 				           Endpoint(destination.addresses, WLTOKEN_ENDPOINT_NOT_FOUND),
 				           false);
 			}
@@ -1103,12 +1117,12 @@ static int getNewBufferSize(const uint8_t* begin,
 	                          packetLen + sizeof(uint32_t) * (peerAddress.isTLS() ? 2 : 3));
 }
 
+// This actor exists whenever there is an open or opening connection, whether incoming or outgoing
+// For incoming connections conn is set and peer is initially nullptr; for outgoing connections it is the reverse
 ACTOR static Future<Void> connectionReader(TransportData* transport,
                                            Reference<IConnection> conn,
                                            Reference<Peer> peer,
                                            Promise<Reference<Peer>> onConnected) {
-	// This actor exists whenever there is an open or opening connection, whether incoming or outgoing
-	// For incoming connections conn is set and peer is initially nullptr; for outgoing connections it is the reverse
 
 	state Arena arena;
 	state uint8_t* unprocessed_begin = nullptr;
@@ -1206,7 +1220,11 @@ ACTOR static Future<Void> connectionReader(TransportData* transport,
 								    now() + FLOW_KNOBS->CONNECTION_ID_TIMEOUT;
 							}
 							compatible = false;
-							if (!protocolVersion.hasMultiVersionClient()) {
+							if (!protocolVersion.hasInexpensiveMultiVersionClient()) {
+								if (peer) {
+									peer->protocolVersion->set(protocolVersion);
+								}
+
 								// Older versions expected us to hang up. It may work even if we don't hang up here, but
 								// it's safer to keep the old behavior.
 								throw incompatible_protocol_version();
@@ -1256,6 +1274,7 @@ ACTOR static Future<Void> connectionReader(TransportData* transport,
 							onConnected.send(peer);
 							wait(delay(0)); // Check for cancellation
 						}
+						peer->protocolVersion->set(peerProtocolVersion);
 					}
 				}
 
@@ -1419,6 +1438,10 @@ NetworkAddress FlowTransport::getLocalAddress() const {
 	return self->localAddresses.address;
 }
 
+const std::unordered_map<NetworkAddress, Reference<Peer>>& FlowTransport::getAllPeers() const {
+	return self->peers;
+}
+
 std::map<NetworkAddress, std::pair<uint64_t, double>>* FlowTransport::getIncompatiblePeers() {
 	for (auto it = self->incompatiblePeers.begin(); it != self->incompatiblePeers.end();) {
 		if (self->multiVersionConnections.count(it->second.first)) {
@@ -1453,7 +1476,7 @@ Endpoint FlowTransport::loadedEndpoint(const UID& token) {
 }
 
 void FlowTransport::addPeerReference(const Endpoint& endpoint, bool isStream) {
-	if (!isStream || !endpoint.getPrimaryAddress().isValid())
+	if (!isStream || !endpoint.getPrimaryAddress().isValid() || !endpoint.getPrimaryAddress().isPublic())
 		return;
 
 	Reference<Peer> peer = self->getOrOpenPeer(endpoint.getPrimaryAddress());
@@ -1465,7 +1488,7 @@ void FlowTransport::addPeerReference(const Endpoint& endpoint, bool isStream) {
 }
 
 void FlowTransport::removePeerReference(const Endpoint& endpoint, bool isStream) {
-	if (!isStream || !endpoint.getPrimaryAddress().isValid())
+	if (!isStream || !endpoint.getPrimaryAddress().isValid() || !endpoint.getPrimaryAddress().isPublic())
 		return;
 	Reference<Peer> peer = self->getPeer(endpoint.getPrimaryAddress());
 	if (peer) {
@@ -1667,6 +1690,16 @@ Reference<Peer> FlowTransport::sendUnreliable(ISerializeSource const& what,
 
 Reference<AsyncVar<bool>> FlowTransport::getDegraded() {
 	return self->degraded;
+}
+
+// Returns the protocol version of the peer at the specified address. The result is returned as an AsyncVar that
+// can be used to monitor for changes of a peer's protocol. The protocol version will be unset in the event that
+// there is no connection established to the peer.
+//
+// Note that this function does not establish a connection to the peer. In order to obtain a peer's protocol
+// version, some other mechanism should be used to connect to that peer.
+Reference<AsyncVar<Optional<ProtocolVersion>>> FlowTransport::getPeerProtocolAsyncVar(NetworkAddress addr) {
+	return self->peers.at(addr)->protocolVersion;
 }
 
 void FlowTransport::resetConnection(NetworkAddress address) {

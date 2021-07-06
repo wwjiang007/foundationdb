@@ -42,6 +42,7 @@
 #include "fdbserver/ProxyCommitData.actor.h"
 #include "fdbserver/RatekeeperInterface.h"
 #include "fdbserver/RecoveryState.h"
+#include "fdbserver/RestoreUtil.h"
 #include "fdbserver/WaitFailure.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "flow/ActorCollection.h"
@@ -569,7 +570,7 @@ ACTOR Future<Void> preresolutionProcessing(CommitBatchContext* self) {
 	if (self->localBatchNumber - self->pProxyCommitData->latestLocalCommitBatchResolving.get() >
 	        SERVER_KNOBS->RESET_MASTER_BATCHES &&
 	    now() - self->pProxyCommitData->lastMasterReset > SERVER_KNOBS->RESET_MASTER_DELAY) {
-		TraceEvent(SevWarnAlways, "ResetMasterNetwork")
+		TraceEvent(SevWarnAlways, "ResetMasterNetwork", self->pProxyCommitData->dbgid)
 		    .detail("CurrentBatch", self->localBatchNumber)
 		    .detail("InProcessBatch", self->pProxyCommitData->latestLocalCommitBatchResolving.get());
 		FlowTransport::transport().resetConnection(self->pProxyCommitData->master.address());
@@ -687,10 +688,11 @@ ACTOR Future<Void> getResolution(CommitBatchContext* self) {
 	if (self->localBatchNumber - self->pProxyCommitData->latestLocalCommitBatchLogging.get() >
 	        SERVER_KNOBS->RESET_RESOLVER_BATCHES &&
 	    now() - self->pProxyCommitData->lastResolverReset > SERVER_KNOBS->RESET_RESOLVER_DELAY) {
-		TraceEvent(SevWarnAlways, "ResetResolverNetwork")
-		    .detail("CurrentBatch", self->localBatchNumber)
-		    .detail("InProcessBatch", self->pProxyCommitData->latestLocalCommitBatchLogging.get());
 		for (int r = 0; r < self->pProxyCommitData->resolvers.size(); r++) {
+			TraceEvent(SevWarnAlways, "ResetResolverNetwork", self->pProxyCommitData->dbgid)
+			    .detail("PeerAddr", self->pProxyCommitData->resolvers[r].address())
+			    .detail("CurrentBatch", self->localBatchNumber)
+			    .detail("InProcessBatch", self->pProxyCommitData->latestLocalCommitBatchLogging.get());
 			FlowTransport::transport().resetConnection(self->pProxyCommitData->resolvers[r].address());
 		}
 		self->pProxyCommitData->lastResolverReset = now();
@@ -1061,7 +1063,8 @@ ACTOR Future<Void> postResolution(CommitBatchContext* self) {
 	state const Optional<UID>& debugID = self->debugID;
 	state Span span("MP:postResolution"_loc, self->span.context);
 
-	TEST(pProxyCommitData->latestLocalCommitBatchLogging.get() < localBatchNumber - 1); // Queuing post-resolution commit processing
+	bool queuedCommits = pProxyCommitData->latestLocalCommitBatchLogging.get() < localBatchNumber - 1;
+	TEST(queuedCommits); // Queuing post-resolution commit processing
 	wait(pProxyCommitData->latestLocalCommitBatchLogging.whenAtLeast(localBatchNumber - 1));
 	wait(yield(TaskPriority::ProxyCommitYield1));
 
@@ -1182,6 +1185,9 @@ ACTOR Future<Void> postResolution(CommitBatchContext* self) {
 	                                                          self->toCommit,
 	                                                          span.context,
 	                                                          self->debugID);
+
+	float ratio = self->toCommit.getEmptyMessageRatio();
+	pProxyCommitData->stats.commitBatchingEmptyMessageRatio.addMeasurement(ratio);
 
 	if (!self->forceRecovery) {
 		ASSERT(pProxyCommitData->latestLocalCommitBatchLogging.get() == self->localBatchNumber - 1);
@@ -1377,6 +1383,7 @@ ACTOR Future<Void> reply(CommitBatchContext* self) {
 	                          pProxyCommitData->commitBatchInterval *
 	                              (1 - SERVER_KNOBS->COMMIT_TRANSACTION_BATCH_INTERVAL_SMOOTHER_ALPHA)));
 
+	pProxyCommitData->stats.commitBatchingWindowSize.addMeasurement(pProxyCommitData->commitBatchInterval);
 	pProxyCommitData->commitBatchesMemBytesCount -= self->currentBatchMemBytesCount;
 	ASSERT_ABORT(pProxyCommitData->commitBatchesMemBytesCount >= 0);
 	wait(self->releaseFuture);
@@ -1405,8 +1412,10 @@ ACTOR Future<Void> commitBatch(ProxyCommitData* self,
 	/////// Phase 1: Pre-resolution processing (CPU bound except waiting for a version # which is separately pipelined
 	/// and *should* be available by now (unless empty commit); ordered; currently atomic but could yield)
 	wait(CommitBatch::preresolutionProcessing(&context));
-	if (context.rejected)
+	if (context.rejected) {
+		self->commitBatchesMemBytesCount -= currentBatchMemBytesCount;
 		return Void();
+	}
 
 	/////// Phase 2: Resolution (waiting on the network; pipelined)
 	wait(CommitBatch::getResolution(&context));
@@ -1425,11 +1434,26 @@ ACTOR Future<Void> commitBatch(ProxyCommitData* self,
 	return Void();
 }
 
+// Add tss mapping data to the reply, if any of the included storage servers have a TSS pair
+void maybeAddTssMapping(GetKeyServerLocationsReply& reply,
+                        ProxyCommitData* commitData,
+                        std::unordered_set<UID>& included,
+                        UID ssId) {
+	if (!included.count(ssId)) {
+		auto mappingItr = commitData->tssMapping.find(ssId);
+		if (mappingItr != commitData->tssMapping.end()) {
+			reply.resultsTssMapping.push_back(*mappingItr);
+		}
+		included.insert(ssId);
+	}
+}
+
 ACTOR static Future<Void> doKeyServerLocationRequest(GetKeyServerLocationsRequest req, ProxyCommitData* commitData) {
 	// We can't respond to these requests until we have valid txnStateStore
 	wait(commitData->validState.getFuture());
 	wait(delay(0, TaskPriority::DefaultEndpoint));
 
+	std::unordered_set<UID> tssMappingsIncluded;
 	GetKeyServerLocationsReply rep;
 	if (!req.end.present()) {
 		auto r = req.reverse ? commitData->keyInfo.rangeContainingKeyBefore(req.begin)
@@ -1438,8 +1462,9 @@ ACTOR static Future<Void> doKeyServerLocationRequest(GetKeyServerLocationsReques
 		ssis.reserve(r.value().src_info.size());
 		for (auto& it : r.value().src_info) {
 			ssis.push_back(it->interf);
+			maybeAddTssMapping(rep, commitData, tssMappingsIncluded, it->interf.id());
 		}
-		rep.results.push_back(std::make_pair(r.range(), ssis));
+		rep.results.emplace_back(r.range(), ssis);
 	} else if (!req.reverse) {
 		int count = 0;
 		for (auto r = commitData->keyInfo.rangeContaining(req.begin);
@@ -1449,8 +1474,9 @@ ACTOR static Future<Void> doKeyServerLocationRequest(GetKeyServerLocationsReques
 			ssis.reserve(r.value().src_info.size());
 			for (auto& it : r.value().src_info) {
 				ssis.push_back(it->interf);
+				maybeAddTssMapping(rep, commitData, tssMappingsIncluded, it->interf.id());
 			}
-			rep.results.push_back(std::make_pair(r.range(), ssis));
+			rep.results.emplace_back(r.range(), ssis);
 			count++;
 		}
 	} else {
@@ -1461,8 +1487,9 @@ ACTOR static Future<Void> doKeyServerLocationRequest(GetKeyServerLocationsReques
 			ssis.reserve(r.value().src_info.size());
 			for (auto& it : r.value().src_info) {
 				ssis.push_back(it->interf);
+				maybeAddTssMapping(rep, commitData, tssMappingsIncluded, it->interf.id());
 			}
-			rep.results.push_back(std::make_pair(r.range(), ssis));
+			rep.results.emplace_back(r.range(), ssis);
 			if (r == commitData->keyInfo.ranges().begin()) {
 				break;
 			}
@@ -1506,8 +1533,7 @@ ACTOR static Future<Void> rejoinServer(CommitProxyInterface proxy, ProxyCommitDa
 			GetStorageServerRejoinInfoReply rep;
 			rep.version = commitData->version;
 			rep.tag = decodeServerTagValue(commitData->txnStateStore->readValue(serverTagKeyFor(req.id)).get().get());
-			Standalone<RangeResultRef> history =
-			    commitData->txnStateStore->readRange(serverTagHistoryRangeFor(req.id)).get();
+			RangeResult history = commitData->txnStateStore->readRange(serverTagHistoryRangeFor(req.id)).get();
 			for (int i = history.size() - 1; i >= 0; i--) {
 				rep.history.push_back(
 				    std::make_pair(decodeServerTagHistoryKey(history[i].key), decodeServerTagValue(history[i].value)));
@@ -1931,18 +1957,18 @@ ACTOR Future<Void> commitProxyServerCore(CommitProxyInterface proxy,
 
 				if (txnSequences.size() == maxSequence) {
 					state KeyRange txnKeys = allKeys;
-					Standalone<RangeResultRef> UIDtoTagMap = commitData.txnStateStore->readRange(serverTagKeys).get();
+					RangeResult UIDtoTagMap = commitData.txnStateStore->readRange(serverTagKeys).get();
 					state std::map<Tag, UID> tag_uid;
 					for (const KeyValueRef kv : UIDtoTagMap) {
 						tag_uid[decodeServerTagValue(kv.value)] = decodeServerTagKey(kv.key);
 					}
 					loop {
 						wait(yield());
-						Standalone<RangeResultRef> data = commitData.txnStateStore
-						                                      ->readRange(txnKeys,
-						                                                  SERVER_KNOBS->BUGGIFIED_ROW_LIMIT,
-						                                                  SERVER_KNOBS->APPLY_MUTATION_BYTES)
-						                                      .get();
+						RangeResult data = commitData.txnStateStore
+						                       ->readRange(txnKeys,
+						                                   SERVER_KNOBS->BUGGIFIED_ROW_LIMIT,
+						                                   SERVER_KNOBS->APPLY_MUTATION_BYTES)
+						                       .get();
 						if (!data.size())
 							break;
 						((KeyRangeRef&)txnKeys) = KeyRangeRef(keyAfter(data.back().key, txnKeys.arena()), txnKeys.end);

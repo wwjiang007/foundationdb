@@ -130,6 +130,9 @@ public:
 	UID id;
 	std::string filename;
 
+	// For files that use atomic write and create, they are initially created with an extra suffix
+	std::string initialFilename;
+
 	// An approximation of the size of the file; .size() should be used instead of this variable in most cases
 	mutable int64_t approximateSize;
 
@@ -145,8 +148,17 @@ private:
 	// The maximum amount of time a write is delayed before being passed along to the underlying file
 	double maxWriteDelay;
 
-	// Modifications which haven't been pushed to file, mapped by the location in the file that is being modified
+	// Modifications which haven't been pushed to file, mapped by the location in the file that is being modified.
+	// Be sure to update minSizeAfterPendingModifications when modifying pendingModifications.
 	RangeMap<uint64_t, Future<Void>> pendingModifications;
+	// The size of the file after the set of pendingModifications completes,
+	// (the set pending at the time of reading this member). Must be updated in
+	// lockstep with any inserts into the pendingModifications map. Tracking
+	// this variable is necessary so that we can know the range of the file a
+	// truncate is modifying, so we can insert it into the pendingModifications
+	// map. Until minSizeAfterPendingModificationsIsExact is true, this is only a lower bound.
+	mutable int64_t minSizeAfterPendingModifications = 0;
+	mutable bool minSizeAfterPendingModificationsIsExact = false;
 
 	// Will be blocked whenever kill is running
 	Promise<Void> killed;
@@ -173,11 +185,13 @@ private:
 	    reponses; // cannot call getResult on this actor collection, since the actors will be on different processes
 
 	AsyncFileNonDurable(const std::string& filename,
+	                    const std::string& initialFilename,
 	                    Reference<IAsyncFile> file,
 	                    Reference<DiskParameters> diskParameters,
 	                    NetworkAddress openedAddress,
 	                    bool aio)
-	  : openedAddress(openedAddress), pendingModifications(uint64_t(-1)), approximateSize(0), reponses(false),
+	  : filename(filename), initialFilename(initialFilename), file(file), diskParameters(diskParameters),
+	    openedAddress(openedAddress), pendingModifications(uint64_t(-1)), approximateSize(0), reponses(false),
 	    aio(aio) {
 
 		// This is only designed to work in simulation
@@ -185,10 +199,7 @@ private:
 		this->id = deterministicRandom()->randomUniqueID();
 
 		//TraceEvent("AsyncFileNonDurable_Create", id).detail("Filename", filename);
-		this->file = file;
-		this->filename = filename;
-		this->diskParameters = diskParameters;
-		maxWriteDelay = 5.0;
+		maxWriteDelay = FLOW_KNOBS->NON_DURABLE_MAX_WRITE_DELAY;
 		hasBeenSynced = false;
 
 		killMode = (KillMode)deterministicRandom()->randomInt(1, 3);
@@ -227,10 +238,11 @@ public:
 				//TraceEvent("AsyncFileNonDurableOpenWaitOnDelete2").detail("Filename", filename);
 				if (shutdown.isReady())
 					throw io_error().asInjectedFault();
+				wait(g_simulator.onProcess(currentProcess, currentTaskID));
 			}
 
 			state Reference<AsyncFileNonDurable> nonDurableFile(
-			    new AsyncFileNonDurable(filename, file, diskParameters, currentProcess->address, aio));
+			    new AsyncFileNonDurable(filename, actualFilename, file, diskParameters, currentProcess->address, aio));
 
 			// Causes the approximateSize member to be set
 			state Future<int64_t> sizeFuture = nonDurableFile->size();
@@ -260,13 +272,38 @@ public:
 	}
 
 	void addref() override { ReferenceCounted<AsyncFileNonDurable>::addref(); }
+
 	void delref() override {
 		if (delref_no_destroy()) {
-			ASSERT(filesBeingDeleted.count(filename) == 0);
-			//TraceEvent("AsyncFileNonDurable_StartDelete", id).detail("Filename", filename);
-			Future<Void> deleteFuture = deleteFile(this);
-			if (!deleteFuture.isReady())
-				filesBeingDeleted[filename] = deleteFuture;
+			if (filesBeingDeleted.count(filename) == 0) {
+				//TraceEvent("AsyncFileNonDurable_StartDelete", id).detail("Filename", filename);
+				Future<Void> deleteFuture = deleteFile(this);
+				if (!deleteFuture.isReady())
+					filesBeingDeleted[filename] = deleteFuture;
+			}
+
+			removeOpenFile(filename, this);
+			if (initialFilename != filename) {
+				removeOpenFile(initialFilename, this);
+			}
+		}
+	}
+
+	// Removes a file from the openFiles map
+	static void removeOpenFile(std::string filename, AsyncFileNonDurable* file) {
+		auto& openFiles = g_simulator.getCurrentProcess()->machine->openFiles;
+
+		auto iter = openFiles.find(filename);
+
+		// Various actions (e.g. simulated delete) can remove a file from openFiles prematurely, so it may already
+		// be gone. Renamed files (from atomic write and create) will also be present under only one of the two
+		// names.
+		if (iter != openFiles.end()) {
+			// even if the filename exists, it doesn't mean that it references the same file. It could be that the
+			// file was renamed and later a file with the same name was opened.
+			if (iter->second.getPtrIfReady().orDefault(nullptr) == file) {
+				openFiles.erase(iter);
+			}
 		}
 	}
 
@@ -425,7 +462,8 @@ private:
 		state TaskPriority currentTaskID = g_network->getCurrentTask();
 		wait(g_simulator.onMachine(currentProcess));
 
-		state double delayDuration = deterministicRandom()->random01() * self->maxWriteDelay;
+		state double delayDuration =
+		    g_simulator.speedUpSimulation ? 0.0001 : (deterministicRandom()->random01() * self->maxWriteDelay);
 		state Standalone<StringRef> dataCopy(StringRef((uint8_t*)data, length));
 
 		state Future<bool> startSyncFuture = self->startSyncPromise.getFuture();
@@ -437,8 +475,9 @@ private:
 			Future<Void> writeEnded = wait(ownFuture);
 			std::vector<Future<Void>> priorModifications =
 			    self->getModificationsAndInsert(offset, length, true, writeEnded);
+			self->minSizeAfterPendingModifications = std::max(self->minSizeAfterPendingModifications, offset + length);
 
-			if (BUGGIFY_WITH_PROB(0.001))
+			if (BUGGIFY_WITH_PROB(0.001) && !g_simulator.speedUpSimulation)
 				priorModifications.push_back(
 				    delay(deterministicRandom()->random01() * FLOW_KNOBS->MAX_PRIOR_MODIFICATION_DELAY) ||
 				    self->killed.getFuture());
@@ -596,16 +635,27 @@ private:
 		state TaskPriority currentTaskID = g_network->getCurrentTask();
 		wait(g_simulator.onMachine(currentProcess));
 
-		state double delayDuration = deterministicRandom()->random01() * self->maxWriteDelay;
+		state double delayDuration =
+		    g_simulator.speedUpSimulation ? 0.0001 : (deterministicRandom()->random01() * self->maxWriteDelay);
 		state Future<bool> startSyncFuture = self->startSyncPromise.getFuture();
 
 		try {
 			//TraceEvent("AsyncFileNonDurable_Truncate", self->id).detail("Delay", delayDuration).detail("Filename", self->filename);
 			wait(checkKilled(self, "Truncate"));
 
-			Future<Void> truncateEnded = wait(ownFuture);
+			state Future<Void> truncateEnded = wait(ownFuture);
+
+			// Need to know the size of the file directly before this truncate
+			// takes effect to see what range it modifies.
+			if (!self->minSizeAfterPendingModificationsIsExact) {
+				wait(success(self->size()));
+			}
+			ASSERT(self->minSizeAfterPendingModificationsIsExact);
+			int64_t beginModifiedRange = std::min(size, self->minSizeAfterPendingModifications);
+			self->minSizeAfterPendingModifications = size;
+
 			std::vector<Future<Void>> priorModifications =
-			    self->getModificationsAndInsert(size, -1, true, truncateEnded);
+			    self->getModificationsAndInsert(beginModifiedRange, /*through end of file*/ -1, true, truncateEnded);
 
 			if (BUGGIFY_WITH_PROB(0.001))
 				priorModifications.push_back(
@@ -751,8 +801,9 @@ private:
 		wait(checkKilled(self, "SizeEnd"));
 
 		// Include any modifications which extend past the end of the file
-		uint64_t maxModification = self->pendingModifications.lastItem().begin();
-		self->approximateSize = std::max<int64_t>(sizeFuture.get(), maxModification);
+		self->approximateSize = self->minSizeAfterPendingModifications =
+		    std::max<int64_t>(sizeFuture.get(), self->minSizeAfterPendingModifications);
+		self->minSizeAfterPendingModificationsIsExact = true;
 		return self->approximateSize;
 	}
 
@@ -809,11 +860,9 @@ private:
 			//TraceEvent("AsyncFileNonDurable_FinishDelete", self->id).detail("Filename", self->filename);
 
 			delete self;
-			wait(g_simulator.onProcess(currentProcess, currentTaskID));
 			return Void();
 		} catch (Error& e) {
 			state Error err = e;
-			wait(g_simulator.onProcess(currentProcess, currentTaskID));
 			throw err;
 		}
 	}

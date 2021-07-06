@@ -176,8 +176,8 @@ ShardSizeBounds getShardSizeBounds(KeyRangeRef shard, int64_t maxShardSize) {
 }
 
 int64_t getMaxShardSize(double dbSizeEstimate) {
-	return std::min((SERVER_KNOBS->MIN_SHARD_BYTES +
-	                 (int64_t)std::sqrt(dbSizeEstimate) * SERVER_KNOBS->SHARD_BYTES_PER_SQRT_BYTES) *
+	return std::min((SERVER_KNOBS->MIN_SHARD_BYTES + (int64_t)std::sqrt(std::max<double>(dbSizeEstimate, 0)) *
+	                                                     SERVER_KNOBS->SHARD_BYTES_PER_SQRT_BYTES) *
 	                    SERVER_KNOBS->SHARD_BYTES_RATIO,
 	                (int64_t)SERVER_KNOBS->MAX_SHARD_BYTES);
 }
@@ -997,10 +997,6 @@ void ShardsAffectedByTeamFailure::erase(Team team, KeyRange const& range) {
 			}
 		}
 	}
-}
-
-void ShardsAffectedByTeamFailure::eraseServer(UID ssID) {
-	storageServerShards[ssID] = 0;
 }
 
 void ShardsAffectedByTeamFailure::insert(Team team, KeyRange const& range) {

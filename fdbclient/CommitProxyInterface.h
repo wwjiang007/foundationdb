@@ -1,4 +1,3 @@
-
 /*
  * CommitProxyInterface.h
  *
@@ -29,8 +28,8 @@
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/StorageServerInterface.h"
 #include "fdbclient/CommitTransaction.h"
-#include "fdbserver/RatekeeperInterface.h"
 #include "fdbclient/TagThrottle.h"
+#include "fdbclient/GlobalConfig.h"
 
 #include "fdbrpc/Stats.h"
 #include "fdbrpc/TimedRequest.h"
@@ -113,16 +112,10 @@ struct ClientDBInfo {
 	vector<CommitProxyInterface> commitProxies;
 	Optional<CommitProxyInterface>
 	    firstCommitProxy; // not serialized, used for commitOnFirstProxy when the commit proxies vector has been shrunk
-	double clientTxnInfoSampleRate;
-	int64_t clientTxnInfoSizeLimit;
 	Optional<Value> forward;
-	double transactionTagSampleRate;
-	double transactionTagSampleCost;
+	vector<VersionHistory> history;
 
-	ClientDBInfo()
-	  : clientTxnInfoSampleRate(std::numeric_limits<double>::infinity()), clientTxnInfoSizeLimit(-1),
-	    transactionTagSampleRate(CLIENT_KNOBS->READ_TAG_SAMPLE_RATE),
-	    transactionTagSampleCost(CLIENT_KNOBS->COMMIT_SAMPLE_COST) {}
+	ClientDBInfo() {}
 
 	bool operator==(ClientDBInfo const& r) const { return id == r.id; }
 	bool operator!=(ClientDBInfo const& r) const { return id != r.id; }
@@ -132,15 +125,7 @@ struct ClientDBInfo {
 		if constexpr (!is_fb_function<Archive>) {
 			ASSERT(ar.protocolVersion().isValid());
 		}
-		serializer(ar,
-		           grvProxies,
-		           commitProxies,
-		           id,
-		           clientTxnInfoSampleRate,
-		           clientTxnInfoSizeLimit,
-		           forward,
-		           transactionTagSampleRate,
-		           transactionTagSampleCost);
+		serializer(ar, grvProxies, commitProxies, id, forward, history);
 	}
 };
 
@@ -301,9 +286,12 @@ struct GetKeyServerLocationsReply {
 	Arena arena;
 	std::vector<std::pair<KeyRangeRef, vector<StorageServerInterface>>> results;
 
+	// if any storage servers in results have a TSS pair, that mapping is in here
+	std::vector<std::pair<UID, StorageServerInterface>> resultsTssMapping;
+
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, results, arena);
+		serializer(ar, results, resultsTssMapping, arena);
 	}
 };
 

@@ -178,7 +178,6 @@ public:
 	void moveShard(KeyRangeRef keys, std::vector<Team> destinationTeam);
 	void finishMove(KeyRangeRef keys);
 	void check();
-	void eraseServer(UID ssID);
 
 private:
 	struct OrderByTeamKey {
@@ -264,6 +263,7 @@ ACTOR Future<Void> dataDistributionQueue(Database cx,
                                          Reference<ShardsAffectedByTeamFailure> shardsAffectedByTeamFailure,
                                          MoveKeysLock lock,
                                          PromiseStream<Promise<int64_t>> getAverageShardBytes,
+                                         PromiseStream<Promise<int>> getUnhealthyRelocationCount,
                                          UID distributorId,
                                          int teamSize,
                                          int singleRegionTeamSize,

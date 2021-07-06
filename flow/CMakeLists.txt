@@ -28,6 +28,7 @@ set(FLOW_SRCS
   Histogram.h
   IDispatched.h
   IRandom.h
+  IThreadPoolTest.actor.cpp
   IThreadPool.cpp
   IThreadPool.h
   ITrace.h
@@ -58,7 +59,7 @@ set(FLOW_SRCS
   TLSConfig.actor.cpp
   TLSConfig.actor.h
   ThreadHelper.actor.h
-  ThreadHelper.cpp
+  ThreadHelper.actor.cpp
   ThreadPrimitives.cpp
   ThreadPrimitives.h
   ThreadSafeQueue.h
@@ -67,6 +68,7 @@ set(FLOW_SRCS
   Tracing.h
   Tracing.actor.cpp
   TreeBenchmark.h
+  TypeTraits.h
   UnitTest.cpp
   UnitTest.h
   XmlTraceLogFormatter.cpp

@@ -27,6 +27,7 @@
                   "storage",
                   "transaction",
                   "resolution",
+                  "stateless",
                   "commit_proxy",
                   "grv_proxy",
                   "master",
@@ -120,8 +121,30 @@
                      "counter":0,
                      "roughness":0.0
                   },
-                  "grv_latency_statistics":{
+                  "fetched_versions":{
+                     "hz":0.0,
+                     "counter":0,
+                     "roughness":0.0
+                  },
+                  "fetches_from_logs":{
+                     "hz":0.0,
+                     "counter":0,
+                     "roughness":0.0
+                  },
+                  "grv_latency_statistics":{ // GRV Latency metrics are grouped according to priority (currently batch or default).
                      "default":{
+                         "count":0,
+                         "min":0.0,
+                         "max":0.0,
+                         "median":0.0,
+                         "mean":0.0,
+                         "p25":0.0,
+                         "p90":0.0,
+                         "p95":0.0,
+                         "p99":0.0,
+                         "p99.9":0.0
+                     },
+                     "batch":{
                          "count":0,
                          "min":0.0,
                          "max":0.0,
@@ -147,6 +170,18 @@
                      "p99.9":0.0
                   },
                   "commit_latency_statistics":{
+                     "count":0,
+                     "min":0.0,
+                     "max":0.0,
+                     "median":0.0,
+                     "mean":0.0,
+                     "p25":0.0,
+                     "p90":0.0,
+                     "p95":0.0,
+                     "p99":0.0,
+                     "p99.9":0.0
+                  },
+                  "commit_batching_window_size":{
                      "count":0,
                      "min":0.0,
                      "max":0.0,
@@ -495,7 +530,7 @@
                "hz":0.0,
                "counter":0,
                "roughness":0.0
-            }, 
+            },
              "low_priority_reads":{ // measures number of incoming low priority read requests
                "hz":0.0,
                "counter":0,
@@ -579,6 +614,10 @@
       "data_distribution_disabled_for_rebalance":true,
       "data_distribution_disabled":true,
       "active_primary_dc":"pv",
+      "bounce_impact":{
+         "can_clean_bounce":true,
+         "reason":""
+      },
       "configuration":{
          "log_anti_quorum":0,
          "log_replicas":2,
@@ -643,17 +682,30 @@
              "ssd-rocksdb-experimental",
              "memory"
          ]},
+         "tss_count":1,
+         "tss_storage_engine":{
+         "$enum":[
+             "ssd",
+             "ssd-1",
+             "ssd-2",
+             "ssd-redwood-experimental",
+             "ssd-rocksdb-experimental",
+             "memory"
+         ]},
          "coordinators_count":1,
          "excluded_servers":[
             {
-               "address":"10.0.4.1"
+               "address":"10.0.4.1",
+               "locality":"locality_processid:e9816ca4a89ff64ddb7ba2a5ec10b75b"
             }
          ],
          "auto_commit_proxies":3,
          "auto_resolvers":1,
          "auto_logs":3,
          "backup_worker_enabled":1,
-         "commit_proxies":5 // this field will be absent if a value has not been explicitly set
+         "commit_proxies":5, // this field will be absent if a value has not been explicitly set
+         "proxies":6, // this field will be absent if a value has not been explicitly set
+         "perpetual_storage_wiggle": 0
       },
       "data":{
          "least_operating_space_bytes_log_server":0,

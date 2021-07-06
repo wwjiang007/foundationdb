@@ -355,7 +355,6 @@ public:
 		if (localAddress.present()) {
 			fields.addField("Machine", formatIpPort(localAddress.get().ip, localAddress.get().port));
 		}
-
 		fields.addField("LogGroup", logGroup);
 
 		RoleInfo const& r = mutateRoleInfo();
@@ -504,7 +503,7 @@ public:
 		}
 	}
 
-	void addRole(std::string role) {
+	void addRole(std::string const& role) {
 		MutexHolder holder(mutex);
 
 		RoleInfo& r = mutateRoleInfo();
@@ -512,7 +511,7 @@ public:
 		r.refreshRolesString();
 	}
 
-	void removeRole(std::string role) {
+	void removeRole(std::string const& role) {
 		MutexHolder holder(mutex);
 
 		RoleInfo& r = mutateRoleInfo();
@@ -558,13 +557,13 @@ NetworkAddress getAddressIndex() {
 }
 
 // This does not check for simulation, and as such is not safe for external callers
-void clearPrefix_internal(std::map<std::string, TraceEventFields>& data, std::string prefix) {
+void clearPrefix_internal(std::map<std::string, TraceEventFields>& data, std::string const& prefix) {
 	auto first = data.lower_bound(prefix);
 	auto last = data.lower_bound(strinc(prefix).toString());
 	data.erase(first, last);
 }
 
-void LatestEventCache::clear(std::string prefix) {
+void LatestEventCache::clear(std::string const& prefix) {
 	clearPrefix_internal(latest[getAddressIndex()], prefix);
 }
 
@@ -576,7 +575,7 @@ void LatestEventCache::set(std::string tag, const TraceEventFields& contents) {
 	latest[getAddressIndex()][tag] = contents;
 }
 
-TraceEventFields LatestEventCache::get(std::string tag) {
+TraceEventFields LatestEventCache::get(std::string const& tag) {
 	return latest[getAddressIndex()][tag];
 }
 
@@ -653,6 +652,21 @@ bool traceClockSource(std::string& source) {
 		return false;
 	}
 }
+
+std::string toString(ErrorKind errorKind) {
+	switch (errorKind) {
+		case ErrorKind::Unset:
+			return "Unset";
+		case ErrorKind::DiskIssue:
+			return "DiskIssue";
+		case ErrorKind::BugDetected:
+			return "BugDetected";
+		default:
+			UNSTOPPABLE_ASSERT(false);
+			return "";
+	}
+}
+
 } // namespace
 
 bool selectTraceFormatter(std::string format) {
@@ -743,11 +757,11 @@ bool traceFileIsOpen() {
 	return g_traceLog.isOpen();
 }
 
-void addTraceRole(std::string role) {
+void addTraceRole(std::string const& role) {
 	g_traceLog.addRole(role);
 }
 
-void removeTraceRole(std::string role) {
+void removeTraceRole(std::string const& role) {
 	g_traceLog.removeRole(role);
 }
 
@@ -900,6 +914,10 @@ bool TraceEvent::init() {
 		}
 
 		detail("Severity", int(severity));
+		if (severity >= SevError) {
+			detail("ErrorKind", errorKind);
+			errorKindIndex = fields.size()-1;
+		}
 		detail("Time", "0.000000");
 		timeIndex = fields.size() - 1;
 		if (FLOW_KNOBS && FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
@@ -941,6 +959,9 @@ TraceEvent& TraceEvent::errorImpl(class Error const& error, bool includeCancelle
 			detail("Error", error.name());
 			detail("ErrorDescription", error.what());
 			detail("ErrorCode", error.code());
+		}
+		if (err.isDiskError()) {
+			setErrorKind(ErrorKind::DiskIssue);
 		}
 	} else {
 		if (initialized) {
@@ -1084,6 +1105,11 @@ TraceEvent& TraceEvent::suppressFor(double duration, bool logSuppressedEventCoun
 	return *this;
 }
 
+TraceEvent &TraceEvent::setErrorKind(ErrorKind errorKind) {
+	this->errorKind = errorKind;
+	return *this;
+}
+
 TraceEvent& TraceEvent::setMaxFieldLength(int maxFieldLength) {
 	ASSERT(!logged);
 	if (maxFieldLength == 0) {
@@ -1093,6 +1119,17 @@ TraceEvent& TraceEvent::setMaxFieldLength(int maxFieldLength) {
 	}
 
 	return *this;
+}
+
+// A unique, per-thread ID.  This is particularly important for multithreaded
+// or multiversion client setups and for multithreaded storage engines.
+thread_local uint64_t threadId = 0;
+
+void TraceEvent::setThreadId() {
+	while (threadId == 0) {
+		threadId = deterministicRandom()->randomUInt64();
+	}
+	this->detail("ThreadID", threadId);
 }
 
 int TraceEvent::getMaxFieldLength() const {
@@ -1148,10 +1185,15 @@ void TraceEvent::log() {
 					fields.mutate(timeIndex + 1).second = TraceEvent::printRealTime(time);
 				}
 
+				setThreadId();
+
 				if (this->severity == SevError) {
 					severity = SevInfo;
 					backtrace();
 					severity = SevError;
+					if (errorKindIndex != -1) {
+						fields.mutate(errorKindIndex).second = toString(errorKind);
+					}
 				}
 
 				if (isNetworkThread()) {
@@ -1365,12 +1407,12 @@ TraceEventFields::TraceEventFields() : bytes(0), annotated(false) {}
 
 void TraceEventFields::addField(const std::string& key, const std::string& value) {
 	bytes += key.size() + value.size();
-	fields.push_back(std::make_pair(key, value));
+	fields.emplace_back(key, value);
 }
 
 void TraceEventFields::addField(std::string&& key, std::string&& value) {
 	bytes += key.size() + value.size();
-	fields.push_back(std::make_pair(std::move(key), std::move(value)));
+	fields.emplace_back(std::move(key), std::move(value));
 }
 
 size_t TraceEventFields::size() const {

@@ -152,6 +152,7 @@ public:
 		return (DatabaseContext*)DatabaseContext::operator new(sizeof(DatabaseContext));
 	}
 
+	// Static constructor used by server processes to create a DatabaseContext
 	// For internal (fdbserver) use only
 	static Database create(Reference<AsyncVar<ClientDBInfo>> clientInfo,
 	                       Future<Void> clientInfoMonitor,
@@ -164,9 +165,11 @@ public:
 
 	~DatabaseContext();
 
+	// Constructs a new copy of this DatabaseContext from the parameters of this DatabaseContext
 	Database clone() const {
 		return Database(new DatabaseContext(connectionFile,
 		                                    clientInfo,
+		                                    coordinator,
 		                                    clientInfoMonitor,
 		                                    taskID,
 		                                    clientLocality,
@@ -196,6 +199,11 @@ public:
 	Future<Void> onProxiesChanged();
 	Future<HealthMetrics> getHealthMetrics(bool detailed);
 
+	// Returns the protocol version reported by the coordinator this client is connected to
+	// If an expected version is given, the future won't return until the protocol version is different than expected
+	// Note: this will never return if the server is running a protocol from FDB 5.0 or older
+	Future<ProtocolVersion> getClusterProtocol(Optional<ProtocolVersion> expectedVersion = Optional<ProtocolVersion>());
+
 	// Update the watch counter for the database
 	void addWatch();
 	void removeWatch();
@@ -211,15 +219,15 @@ public:
 	Error deferredError;
 	bool lockAware;
 
-	bool isError() { return deferredError.code() != invalid_error_code; }
+	bool isError() const { return deferredError.code() != invalid_error_code; }
 
-	void checkDeferredError() {
+	void checkDeferredError() const {
 		if (isError()) {
 			throw deferredError;
 		}
 	}
 
-	int apiVersionAtLeast(int minVersion) { return apiVersion < 0 || apiVersion >= minVersion; }
+	int apiVersionAtLeast(int minVersion) const { return apiVersion < 0 || apiVersion >= minVersion; }
 
 	Future<Void> onConnected(); // Returns after a majority of coordination servers are available and have reported a
 	                            // leader. The cluster file therefore is valid, but the database might be unavailable.
@@ -247,6 +255,7 @@ public:
 	// private:
 	explicit DatabaseContext(Reference<AsyncVar<Reference<ClusterConnectionFile>>> connectionFile,
 	                         Reference<AsyncVar<ClientDBInfo>> clientDBInfo,
+	                         Reference<AsyncVar<Optional<ClientLeaderRegInterface>>> coordinator,
 	                         Future<Void> clientInfoMonitor,
 	                         TaskPriority taskID,
 	                         LocalityData const& clientLocality,
@@ -264,6 +273,9 @@ public:
 	Reference<AsyncVar<Reference<ClusterConnectionFile>>> connectionFile;
 	AsyncTrigger proxiesChangeTrigger;
 	Future<Void> monitorProxiesInfoChange;
+	Future<Void> monitorTssInfoChange;
+	Future<Void> tssMismatchHandler;
+	PromiseStream<std::pair<UID, std::vector<DetailedTSSMismatch>>> tssMismatchStream;
 	Reference<CommitProxyInfo> commitProxies;
 	Reference<GrvProxyInfo> grvProxies;
 	bool proxyProvisional; // Provisional commit proxy and grv proxy are used at the same time.
@@ -311,6 +323,11 @@ public:
 
 	std::map<UID, StorageServerInfo*> server_interf;
 
+	// map from ssid -> tss interface
+	std::unordered_map<UID, StorageServerInterface> tssMapping;
+	// map from tssid -> metrics for that tss pair
+	std::unordered_map<UID, Reference<TSSMetrics>> tssMetrics;
+
 	UID dbId;
 	bool internal; // Only contexts created through the C client and fdbcli are non-internal
 
@@ -334,6 +351,7 @@ public:
 	Counter transactionGetKeyRequests;
 	Counter transactionGetValueRequests;
 	Counter transactionGetRangeRequests;
+	Counter transactionGetRangeStreamRequests;
 	Counter transactionWatchRequests;
 	Counter transactionGetAddressesForKeyRequests;
 	Counter transactionBytesRead;
@@ -380,6 +398,9 @@ public:
 	Future<Void> clientInfoMonitor;
 	Future<Void> connected;
 
+	// An AsyncVar that reports the coordinator this DatabaseContext is interacting with
+	Reference<AsyncVar<Optional<ClientLeaderRegInterface>>> coordinator;
+
 	Reference<AsyncVar<Optional<ClusterInterface>>> statusClusterInterface;
 	Future<Void> statusLeaderMon;
 	double lastStatusFetch;
@@ -393,6 +414,7 @@ public:
 	double healthMetricsLastUpdated;
 	double detailedHealthMetricsLastUpdated;
 	Smoother smoothMidShardSize;
+	bool useConfigDatabase{ false };
 
 	UniqueOrderedOptionList<FDBTransactionOptions> transactionDefaults;
 
@@ -407,6 +429,14 @@ public:
 	static bool debugUseTags;
 	static const std::vector<std::string> debugTransactionTagChoices;
 	std::unordered_map<KeyRef, Reference<WatchMetadata>> watchMap;
+
+	// Adds or updates the specified (SS, TSS) pair in the TSS mapping (if not already present).
+	// Requests to the storage server will be duplicated to the TSS.
+	void addTssMapping(StorageServerInterface const& ssi, StorageServerInterface const& tssi);
+
+	// Removes the storage server and its TSS pair from the TSS mapping (if present).
+	// Requests to the storage server will no longer be duplicated to its pair TSS.
+	void removeTssMapping(StorageServerInterface const& ssi);
 };
 
 #endif
